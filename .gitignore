@@ -10,6 +10,7 @@ env/
 # Cache and data files
 price-data-*.json
 dashboard-*.png
+!dashboard-example-*.png
 display_output_*.png
 
 # Ansible

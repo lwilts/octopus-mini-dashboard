@@ -7,7 +7,7 @@ gas_product: "SILVER-25-09-02"
 # Display Configuration
 display_width: 320
 display_height: 240
-display_rotation: 180
+display_rotation: 0  # 0, 90, 180, or 270 degrees
 
 # Price Color Thresholds (in pence)
 price_thresholds:

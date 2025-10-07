@@ -2,13 +2,13 @@
 
 A compact Raspberry Pi dashboard that displays real-time Octopus Energy Agile electricity prices on a ST7789 display with color-coded price indicators.
 
-![Dashboard Preview](dashboard-20251006-130651.png)
+![Dashboard Example](dashboard-example-tomorrow.png)
 
 ## Features
 
-- 📊 Real-time Agile electricity pricing with 48-hour chart
-- ⚡ Tomorrow's prices shown when available (12h today + 12h tomorrow)
-- 💰 Gas tracker pricing included
+- 📊 Real-time Agile electricity pricing with 24-hour chart
+- ⚡ Tomorrow's full 24-hour prices shown when available (usually after 4pm)
+- 💰 Gas tracker pricing included (today + tomorrow when available)
 - 🎨 Color-coded price indicators (green/blue/yellow/red based on configurable thresholds)
 - 💾 Smart daily price caching with auto-cleanup
 - 🔄 Systemd service with automatic startup and restart
@@ -16,7 +16,7 @@ A compact Raspberry Pi dashboard that displays real-time Octopus Energy Agile el
 
 ## Hardware Requirements
 
-- Raspberry Pi Zero W (or any Raspberry Pi)
+- Raspberry Pi Zero W (or any Raspberry Pi) with fresh Raspberry Pi OS and SSH enabled
 - [Pimoroni Display HAT Mini](https://shop.pimoroni.com/products/display-hat-mini) (ST7789, 320x240, SPI)
 - Octopus Energy Agile electricity & Gas tracker tariffs
 
@@ -43,6 +43,9 @@ octopus_region: "C"  # e.g., C for London
 # Update product codes if needed
 agile_product: "AGILE-24-10-01"
 gas_product: "SILVER-25-09-02"
+
+# Display rotation (0, 90, 180, or 270 degrees)
+display_rotation: 0
 
 # Adjust price color thresholds (pence)
 price_thresholds:
@@ -75,38 +78,21 @@ The deployment script:
 5. ✅ Creates systemd service
 6. ✅ Starts dashboard automatically
 
-## Display Layout
+## Price Colors
 
-```
-┌──────────────────────────────────┐
-│ Octopus Energy          14:23    │
-├──────────┬──────────┬────────────┤
-│   Now    │   Min    │    Gas     │
-│  24.5p   │  12.3p   │   7.2p     │
-│  (color) ├──────────┤  (orange)  │
-│          │   Max    │   Tmrw     │
-│          │  35.7p   │   7.3p     │
-├──────────┴──────────┴────────────┤
-│       Price Chart (24 bars)      │
-│    ▂▃▄▅█▆▅▄▃▂ │ Tmrw  Max: 28p  │
-│    │          ▁▂▃▅▆█▇▆▅▄▃▂       │
-│    12  16  20  0   4   8         │
-└──────────────────────────────────┘
-```
-
-### Price Colors
 - **Green**: Cheap (< 10p/kWh)
 - **Blue**: Moderate (10-20p/kWh)
 - **Yellow**: Expensive (20-35p/kWh)
 - **Red**: Very expensive (> 35p/kWh)
 - **Orange**: Gas price (always)
 
-### Tomorrow Display
-When tomorrow's prices are available (usually after 4pm):
-- Chart shows last 12 hours of today + first 12 hours of tomorrow
+## Tomorrow's Prices
+
+When tomorrow's prices become available (usually after 4pm):
+- Chart shows full 24 hours of tomorrow's prices
 - Tomorrow section has darker background
 - Shows tomorrow's gas price and max electricity price
-- Midnight (0) label marks the boundary
+- Midnight (0) label marks the day boundary
 
 ## Management
 
