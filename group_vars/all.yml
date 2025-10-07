@@ -1,0 +1,24 @@
+---
+# Octopus Energy Configuration
+octopus_region: "C"  # London - change to your region (e.g., A-P)
+agile_product: "AGILE-24-10-01"
+gas_product: "SILVER-25-09-02"
+
+# Display Configuration
+display_width: 320
+display_height: 240
+display_rotation: 180
+
+# Price Color Thresholds (in pence)
+price_thresholds:
+  cheap: 10      # Under this = green
+  moderate: 20   # Under this = blue
+  expensive: 35  # Under this = yellow, over = red
+
+# Dashboard Update Intervals (seconds)
+update_interval: 300  # Fetch new data every 5 minutes
+redraw_interval: 30   # Redraw display every 30 seconds
+
+# Application Settings
+dashboard_dir: "/home/luke/agile-dashboard"
+dashboard_user: "luke"

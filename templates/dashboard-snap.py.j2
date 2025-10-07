@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""
+Development version of Octopus Energy Dashboard
+Works on any system without Raspberry Pi hardware
+"""
+import time
+import requests
+from datetime import datetime, timedelta
+from PIL import Image, ImageDraw, ImageFont
+import sys
+import os
+
+# Always use mock mode for snapshot script
+import ST7789
+MOCK_MODE = True
+print("Running in SNAPSHOT MODE - will save single image to PNG")
+
+# Display configuration
+WIDTH = 320
+HEIGHT = 240
+ROTATION = 0
+
+# Initialize display
+disp = ST7789.ST7789(
+    height=HEIGHT,
+    width=WIDTH,
+    rotation=ROTATION,
+    port=0,
+    cs=1,
+    dc=9,
+    backlight=13,
+    spi_speed_hz=80 * 1000 * 1000
+)
+
+# Configuration
+REGION = "C"  # London
+AGILE_PRODUCT = "AGILE-24-10-01"
+GAS_PRODUCT = "SILVER-25-09-02"
+
+# Colors
+BG_COLOR = (17, 24, 39)  # gray-900
+TEXT_COLOR = (255, 255, 255)
+BLUE = (59, 130, 246)
+PURPLE = (168, 85, 247)
+ORANGE = (251, 146, 60)
+GRAY = (107, 114, 128)
+GREEN = (34, 197, 94)
+RED = (239, 68, 68)
+
+# Try to load fonts, fall back to default
+try:
+    # Try Linux paths first
+    font_paths = [
+        "/usr/share/fonts/gnu-free/FreeSansBold.ttf",
+        "/usr/share/fonts/liberation-sans-fonts/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",  # macOS
+        "C:\\Windows\\Fonts\\arialbd.ttf",  # Windows
+    ]
+    
+    font_path = None
+    for path in font_paths:
+        if os.path.exists(path):
+            font_path = path
+            break
+    
+    if font_path:
+        font_xlarge = ImageFont.truetype(font_path, 28)
+        font_large = ImageFont.truetype(font_path, 22)
+        font_medium = ImageFont.truetype(font_path, 16)
+        font_small = ImageFont.truetype(font_path, 12)
+        font_tiny = ImageFont.truetype(font_path, 10)
+        print(f"Using font: {font_path}")
+    else:
+        raise Exception("No font found")
+except Exception as e:
+    print(f"Could not load TTF fonts: {e}")
+    print("Using default fonts")
+    font_xlarge = ImageFont.load_default()
+    font_large = ImageFont.load_default()
+    font_medium = ImageFont.load_default()
+    font_small = ImageFont.load_default()
+    font_tiny = ImageFont.load_default()
+
+
+def fetch_agile_prices():
+    """Fetch Agile electricity prices with caching"""
+    try:
+        today = datetime.now().date()
+        cache_file = f"price-data-{today.strftime('%Y-%m-%d')}.json"
+
+        # Clean up old cache files
+        import glob
+        for old_file in glob.glob("price-data-*.json"):
+            try:
+                file_date_str = old_file.replace('price-data-', '').replace('.json', '')
+                file_date = datetime.strptime(file_date_str, '%Y-%m-%d').date()
+                if file_date < today:
+                    os.remove(old_file)
+                    print(f"Removed old cache file: {old_file}")
+            except:
+                pass
+
+        # Check if we have cached data for today
+        if os.path.exists(cache_file):
+            print(f"Loading cached price data from {cache_file}")
+            with open(cache_file, 'r') as f:
+                import json
+                cached_data = json.load(f)
+                # Reconstruct datetime objects
+                prices = []
+                for item in cached_data:
+                    item['timestamp'] = datetime.fromisoformat(item['timestamp'])
+                    prices.append(item)
+                print(f"Loaded {len(prices)} cached price points")
+                return prices
+
+        # Fetch fresh data
+        tomorrow = today + timedelta(days=1)
+        url = f"https://api.octopus.energy/v1/products/{AGILE_PRODUCT}/electricity-tariffs/E-1R-{AGILE_PRODUCT}-{REGION}/standard-unit-rates/"
+        params = {
+            'period_from': f"{today}T00:00:00Z",
+            'period_to': f"{tomorrow}T00:00:00Z"
+        }
+
+        print(f"Fetching Agile prices from: {url}")
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        prices = []
+        for item in data['results']:
+            # Parse UTC time and convert to local time
+            valid_from_utc = datetime.fromisoformat(item['valid_from'].replace('Z', '+00:00'))
+            # Convert to local timezone (UK)
+            valid_from_local = valid_from_utc.astimezone()
+            prices.append({
+                'hour': valid_from_local.hour,
+                'minute': valid_from_local.minute,
+                'price': item['value_inc_vat'],
+                'timestamp': valid_from_local
+            })
+
+        prices.sort(key=lambda x: x['timestamp'])
+        print(f"Fetched {len(prices)} price points")
+
+        # Save to cache
+        import json
+        cache_data = []
+        for item in prices:
+            cache_item = item.copy()
+            cache_item['timestamp'] = cache_item['timestamp'].isoformat()
+            cache_data.append(cache_item)
+
+        with open(cache_file, 'w') as f:
+            json.dump(cache_data, f, indent=2)
+        print(f"Saved price data to cache: {cache_file}")
+
+        return prices
+    except Exception as e:
+        print(f"Error fetching Agile prices: {e}")
+        return []
+
+
+def fetch_gas_price():
+    """Fetch gas tracker price"""
+    try:
+        today = datetime.now().date()
+        
+        url = f"https://api.octopus.energy/v1/products/{GAS_PRODUCT}/gas-tariffs/G-1R-{GAS_PRODUCT}-{REGION}/standard-unit-rates/"
+        params = {
+            'period_from': f"{today}T00:00:00Z",
+            'period_to': f"{today}T23:59:59Z"
+        }
+        
+        print(f"Fetching gas prices from: {url}")
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data['results']:
+            price = data['results'][0]['value_inc_vat']
+            print(f"Gas price: {price}p/kWh")
+            return price
+        return None
+    except Exception as e:
+        print(f"Error fetching gas price: {e}")
+        return None
+
+
+def draw_dashboard(agile_prices, gas_price, save_path=None):
+    """Draw the dashboard on the display"""
+    img = Image.new('RGB', (WIDTH, HEIGHT), color=BG_COLOR)
+    draw = ImageDraw.Draw(img)
+    
+    # Title
+    draw.text((5, 5), "Octopus Energy", font=font_medium, fill=TEXT_COLOR)
+    
+    # Current time
+    now = datetime.now()
+    time_str = now.strftime("%H:%M")
+    draw.text((WIDTH - 60, 5), time_str, font=font_medium, fill=TEXT_COLOR)
+    
+    if not agile_prices:
+        draw.text((10, HEIGHT//2), "Loading...", font=font_medium, fill=TEXT_COLOR)
+        disp.display(img)
+        return
+    
+    # Calculate current price, min, and max
+    current_hour = now.hour
+    current_minute = now.minute
+    current_price = next((p['price'] for p in agile_prices if p['hour'] == current_hour and p['minute'] == current_minute // 30 * 30), None)
+    min_price = min(p['price'] for p in agile_prices)
+    max_price = max(p['price'] for p in agile_prices)
+
+    # Helper function to get color based on price thresholds
+    def get_price_color(price):
+        if price < 10: return GREEN
+        elif price < 20: return BLUE
+        elif price < 35: return (234, 179, 8)  # Yellow
+        else: return RED
+
+    # Draw price boxes (larger version)
+    y_offset = 30
+    box_height = 50
+    box_half_height = box_height // 2
+
+    # Current price box (left third) - color coded by price
+    current_color = get_price_color(current_price) if current_price else BLUE
+    draw.rectangle([(5, y_offset), (WIDTH//3 - 2, y_offset + box_height)], fill=current_color)
+    draw.text((10, y_offset + 3), "Now", font=font_small, fill=(200, 200, 200))
+    if current_price:
+        price_text = f"{current_price:.1f}p"
+        draw.text((10, y_offset + 16), price_text, font=font_xlarge, fill=TEXT_COLOR)
+
+    # Min price box (middle third, top half) - color coded by price
+    min_color = get_price_color(min_price)
+    draw.rectangle([(WIDTH//3 + 2, y_offset), (2*WIDTH//3 - 2, y_offset + box_half_height - 1)], fill=min_color)
+    draw.text((WIDTH//3 + 7, y_offset + 3), "Min", font=font_small, fill=(200, 200, 200))
+    draw.text((WIDTH//3 + 35, y_offset + 3), f"{min_price:.1f}p", font=font_large, fill=TEXT_COLOR)
+
+    # Max price box (middle third, bottom half) - color coded by price
+    max_color = get_price_color(max_price)
+    draw.rectangle([(WIDTH//3 + 2, y_offset + box_half_height + 1), (2*WIDTH//3 - 2, y_offset + box_height)], fill=max_color)
+    draw.text((WIDTH//3 + 7, y_offset + box_half_height + 3), "Max", font=font_small, fill=(200, 200, 200))
+    draw.text((WIDTH//3 + 35, y_offset + box_half_height + 3), f"{max_price:.1f}p", font=font_large, fill=TEXT_COLOR)
+
+    # Gas price box (right third)
+    draw.rectangle([(2*WIDTH//3 + 2, y_offset), (WIDTH - 5, y_offset + box_height)], fill=ORANGE)
+    draw.text((2*WIDTH//3 + 7, y_offset + 3), "Gas", font=font_small, fill=(255, 220, 200))
+    if gas_price:
+        draw.text((2*WIDTH//3 + 7, y_offset + 16), f"{gas_price:.1f}p", font=font_xlarge, fill=TEXT_COLOR)
+    
+    # Draw mini bar chart
+    chart_y = y_offset + box_height + 10
+    chart_height = HEIGHT - chart_y - 20
+    chart_width = WIDTH - 10
+    
+    if agile_prices:
+        # Recalculate for chart (already calculated above but need in this scope)
+        chart_min_price = min(p['price'] for p in agile_prices)
+        chart_max_price = max(p['price'] for p in agile_prices)
+        price_range = chart_max_price - chart_min_price if chart_max_price != chart_min_price else 1
+
+        bar_width = chart_width // len(agile_prices)
+
+        for i, price_data in enumerate(agile_prices):
+            x = 5 + i * bar_width
+            price = price_data['price']
+            hour = price_data['hour']
+            minute = price_data['minute']
+
+            # Normalize height
+            bar_height = int((price - chart_min_price) / price_range * chart_height)
+            y = chart_y + chart_height - bar_height
+
+            # Color coding: under 10p green, under 20p blue, under 35p yellow, over 35p red
+            color = get_price_color(price)
+
+            # Draw the bar
+            draw.rectangle([(x, y), (x + bar_width - 2, chart_y + chart_height)], fill=color)
+
+            # Draw vertical dashed line for current half-hour slot
+            is_current = hour == current_hour and minute == current_minute // 30 * 30
+            if is_current:
+                # Draw vertical dashed white line from bottom of price boxes to bottom of chart
+                line_x = x + bar_width // 2
+                for dash_y in range(y_offset + box_height, chart_y + chart_height, 6):
+                    draw.line([(line_x, dash_y), (line_x, dash_y + 3)], fill=(255, 255, 255), width=2)
+
+            # Draw hour labels for every 4 hours - center them under the bar
+            if minute == 0 and hour % 4 == 0:
+                hour_text = str(hour)
+                # Center the text under the bar
+                text_x = x + (bar_width // 2) - 5
+                draw.text((text_x, chart_y + chart_height + 2), hour_text, font=font_small, fill=TEXT_COLOR)
+    
+    # Save to file in snapshot mode, otherwise display
+    if MOCK_MODE:
+        if save_path is None:
+            timestamp = now.strftime("%Y%m%d-%H%M%S")
+            save_path = f"dashboard-{timestamp}.png"
+        img.save(save_path)
+        print(f"Dashboard snapshot saved to {save_path}")
+    else:
+        disp.display(img)
+
+
+def main():
+    """Main loop"""
+    print("Starting Octopus Energy Dashboard...")
+    print(f"Display: {WIDTH}x{HEIGHT}, Region: {REGION}")
+    print(f"Mode: {'MOCK (saving to files)' if MOCK_MODE else 'REAL HARDWARE'}")
+    
+    disp.begin()
+    
+    # Fetch data immediately
+    print("\nFetching initial data...")
+    agile_prices = fetch_agile_prices()
+    gas_price = fetch_gas_price()
+    
+    # Draw once
+    print("\nDrawing dashboard...")
+    draw_dashboard(agile_prices, gas_price)
+    
+    if MOCK_MODE:
+        print("\n" + "="*50)
+        print("SNAPSHOT MODE - Single image saved")
+        print("="*50)
+        print("Snapshot complete!")
+    else:
+        # Real hardware - run continuously
+        last_update = time.time()
+        update_interval = 300  # 5 minutes
+        
+        while True:
+            try:
+                current_time = time.time()
+                
+                # Update data every 5 minutes
+                if current_time - last_update > update_interval:
+                    print("Fetching new data...")
+                    agile_prices = fetch_agile_prices()
+                    gas_price = fetch_gas_price()
+                    last_update = current_time
+                
+                # Redraw display
+                draw_dashboard(agile_prices, gas_price)
+                
+                time.sleep(30)  # Redraw every 30 seconds for time update
+                
+            except KeyboardInterrupt:
+                print("\nShutting down...")
+                break
+            except Exception as e:
+                print(f"Error in main loop: {e}")
+                time.sleep(10)
+
+
+if __name__ == "__main__":
+    main()

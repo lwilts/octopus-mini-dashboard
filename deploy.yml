@@ -1,0 +1,101 @@
+---
+- name: Deploy Octopus Agile Dashboard to Raspberry Pi
+  hosts: pizero
+  become: yes
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install system dependencies
+      apt:
+        name:
+          - python3
+          - python3-pip
+          - python3-pil
+          - python3-numpy
+          - python3-rpi.gpio
+          - python3-spidev
+          - git
+          - fonts-dejavu
+          - fonts-freefont-ttf
+        state: present
+
+    - name: Enable SPI interface
+      lineinfile:
+        path: /boot/firmware/config.txt
+        regexp: '^#?dtparam=spi='
+        line: 'dtparam=spi=on'
+        state: present
+      notify: reboot pi
+
+    - name: Create dashboard directory
+      file:
+        path: "{{ dashboard_dir }}"
+        state: directory
+        owner: "{{ dashboard_user }}"
+        group: "{{ dashboard_user }}"
+        mode: '0755'
+
+    - name: Copy dashboard files
+      template:
+        src: "{{ item.src }}"
+        dest: "{{ dashboard_dir }}/{{ item.dest }}"
+        owner: "{{ dashboard_user }}"
+        group: "{{ dashboard_user }}"
+        mode: '0755'
+      loop:
+        - { src: 'templates/dashboard.py.j2', dest: 'dashboard.py' }
+        - { src: 'templates/dashboard-snap.py.j2', dest: 'dashboard-snap.py' }
+      notify: restart dashboard
+
+    - name: Copy requirements.txt
+      copy:
+        src: requirements.txt
+        dest: "{{ dashboard_dir }}/requirements.txt"
+        owner: "{{ dashboard_user }}"
+        group: "{{ dashboard_user }}"
+        mode: '0644'
+
+    - name: Install Python packages
+      pip:
+        requirements: "{{ dashboard_dir }}/requirements.txt"
+        executable: pip3
+        extra_args: --break-system-packages
+
+    - name: Install ST7789 library
+      pip:
+        name: st7789
+        executable: pip3
+        extra_args: --break-system-packages
+
+    - name: Create systemd service
+      template:
+        src: templates/dashboard.service.j2
+        dest: /etc/systemd/system/agile-dashboard.service
+        mode: '0644'
+      notify:
+        - reload systemd
+        - restart dashboard
+
+    - name: Enable dashboard service
+      systemd:
+        name: agile-dashboard
+        enabled: yes
+        state: started
+
+  handlers:
+    - name: reboot pi
+      reboot:
+        reboot_timeout: 300
+
+    - name: reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: restart dashboard
+      systemd:
+        name: agile-dashboard
+        state: restarted

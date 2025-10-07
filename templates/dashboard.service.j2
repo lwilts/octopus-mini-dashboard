@@ -1,0 +1,14 @@
+[Unit]
+Description=Octopus Agile Energy Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User={{ dashboard_user }}
+WorkingDirectory={{ dashboard_dir }}
+ExecStart=/usr/bin/python3 {{ dashboard_dir }}/dashboard.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

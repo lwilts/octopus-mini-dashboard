@@ -1,0 +1,553 @@
+#!/usr/bin/env python3
+"""
+Octopus Energy Dashboard for Raspberry Pi with ST7789 Display
+Managed by Ansible - Configuration in group_vars/all.yml
+"""
+import time
+import requests
+from datetime import datetime, timedelta
+from PIL import Image, ImageDraw, ImageFont
+import sys
+import os
+import json
+import glob
+
+# Try to import real ST7789
+try:
+    import ST7789
+    print("Running with real ST7789 display")
+except ImportError:
+    print("ERROR: ST7789 library not found!")
+    print("Install with: pip3 install st7789")
+    sys.exit(1)
+
+# Display configuration
+WIDTH = {{ display_width }}
+HEIGHT = {{ display_height }}
+ROTATION = {{ display_rotation }}
+
+# Initialize display
+disp = ST7789.ST7789(
+    height=HEIGHT,
+    width=WIDTH,
+    rotation=ROTATION,
+    port=0,
+    cs=1,
+    dc=9,
+    backlight=13,
+    spi_speed_hz=80 * 1000 * 1000
+)
+
+# Configuration
+REGION = "{{ octopus_region }}"
+AGILE_PRODUCT = "{{ agile_product }}"
+GAS_PRODUCT = "{{ gas_product }}"
+
+# Price thresholds
+THRESHOLD_CHEAP = {{ price_thresholds.cheap }}
+THRESHOLD_MODERATE = {{ price_thresholds.moderate }}
+THRESHOLD_EXPENSIVE = {{ price_thresholds.expensive }}
+
+# Colors
+BG_COLOR = (17, 24, 39)
+TEXT_COLOR = (255, 255, 255)
+BLUE = (59, 130, 246)
+ORANGE = (251, 146, 60)
+GREEN = (34, 197, 94)
+RED = (239, 68, 68)
+YELLOW = (234, 179, 8)
+
+# Layout constants
+MARGIN = 5
+TITLE_Y = 5
+BOX_Y_OFFSET = 30
+BOX_HEIGHT = 50
+BOX_LABEL_PADDING = 7
+BOX_LABEL_Y_OFFSET = 3
+BOX_PRICE_Y_OFFSET = 16
+CHART_LABEL_SPACING = 30
+CHART_BOTTOM_MARGIN = 20
+GRIDLINE_INTERVAL = 10
+BAR_GAP = 10
+CURRENT_LINE_COLOR = (220, 220, 220)
+LABEL_BRIGHT_COLOR = (245, 245, 245)
+Y_AXIS_LABEL_COLOR = (200, 200, 210)
+TOMORROW_LABEL_COLOR = (230, 230, 240)
+TOMORROW_BG_COLOR = (40, 50, 70)
+GRIDLINE_COLOR = (100, 110, 130)
+
+# Load fonts
+try:
+    font_paths = [
+        "/usr/share/fonts/gnu-free/FreeSansBold.ttf",
+        "/usr/share/fonts/liberation-sans-fonts/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ]
+
+    font_path = None
+    for path in font_paths:
+        if os.path.exists(path):
+            font_path = path
+            break
+
+    if font_path:
+        font_xlarge = ImageFont.truetype(font_path, 28)  # Main prices
+        font_large = ImageFont.truetype(font_path, 20)   # Min/Max prices
+        font_medium = ImageFont.truetype(font_path, 14)  # Tomorrow prices
+        font_small = ImageFont.truetype(font_path, 11)   # X-axis labels
+        font_tiny = ImageFont.truetype(font_path, 9)     # Tiny labels
+        print(f"Using font: {font_path}")
+    else:
+        raise Exception("No font found")
+except Exception as e:
+    print(f"Could not load TTF fonts: {e}")
+    font_xlarge = ImageFont.load_default()
+    font_large = ImageFont.load_default()
+    font_medium = ImageFont.load_default()
+    font_small = ImageFont.load_default()
+    font_tiny = ImageFont.load_default()
+
+
+def get_price_color(price):
+    """Get color based on price thresholds"""
+    if price < THRESHOLD_CHEAP:
+        return GREEN
+    elif price < THRESHOLD_MODERATE:
+        return BLUE
+    elif price < THRESHOLD_EXPENSIVE:
+        return YELLOW
+    else:
+        return RED
+
+
+def serialize_prices_for_cache(prices):
+    """Convert price list to JSON-serializable format"""
+    cache_data = []
+    for item in prices:
+        cache_item = item.copy()
+        cache_item['timestamp'] = cache_item['timestamp'].isoformat()
+        cache_item['date'] = str(cache_item['date'])
+        cache_data.append(cache_item)
+    return cache_data
+
+
+def deserialize_prices_from_cache(cached_data):
+    """Convert cached JSON data back to price list"""
+    prices = []
+    for item in cached_data:
+        item['timestamp'] = datetime.fromisoformat(item['timestamp'])
+        item['date'] = item['timestamp'].date()
+        prices.append(item)
+    return prices
+
+
+def fetch_agile_prices():
+    """Fetch Agile electricity prices with caching - returns (today_prices, tomorrow_prices)"""
+    try:
+        today = datetime.now().date()
+        tomorrow = today + timedelta(days=1)
+
+        today_cache = f"price-data-{today.strftime('%Y-%m-%d')}.json"
+        tomorrow_cache = f"price-data-{tomorrow.strftime('%Y-%m-%d')}.json"
+
+        # Clean up old cache files
+        for old_file in glob.glob("price-data-*.json"):
+            try:
+                file_date_str = old_file.replace('price-data-', '').replace('.json', '')
+                file_date = datetime.strptime(file_date_str, '%Y-%m-%d').date()
+                if file_date < today:
+                    os.remove(old_file)
+                    print(f"Removed old cache file: {old_file}")
+            except:
+                pass
+
+        # Load from cache if available
+        today_prices = []
+        tomorrow_prices = []
+
+        if os.path.exists(today_cache):
+            print(f"Loading cached today prices from {today_cache}")
+            with open(today_cache, 'r') as f:
+                today_prices = deserialize_prices_from_cache(json.load(f))
+
+        if os.path.exists(tomorrow_cache):
+            print(f"Loading cached tomorrow prices from {tomorrow_cache}")
+            with open(tomorrow_cache, 'r') as f:
+                tomorrow_prices = deserialize_prices_from_cache(json.load(f))
+
+        # If we have both from cache, return them
+        if today_prices and tomorrow_prices:
+            print(f"Loaded {len(today_prices)} today + {len(tomorrow_prices)} tomorrow from cache")
+            return today_prices, tomorrow_prices
+
+        # Otherwise fetch fresh data
+        url = f"https://api.octopus.energy/v1/products/{AGILE_PRODUCT}/electricity-tariffs/E-1R-{AGILE_PRODUCT}-{REGION}/standard-unit-rates/"
+
+        # Fetch today
+        if not today_prices:
+            params = {
+                'period_from': f"{today}T00:00:00Z",
+                'period_to': f"{tomorrow}T00:00:00Z"
+            }
+            print(f"Fetching today's prices...")
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            for item in data['results']:
+                valid_from_utc = datetime.fromisoformat(item['valid_from'].replace('Z', '+00:00'))
+                valid_from_local = valid_from_utc.astimezone()
+                if valid_from_local.date() == today:
+                    today_prices.append({
+                        'hour': valid_from_local.hour,
+                        'minute': valid_from_local.minute,
+                        'price': item['value_inc_vat'],
+                        'timestamp': valid_from_local,
+                        'date': valid_from_local.date()
+                    })
+
+            today_prices.sort(key=lambda x: x['timestamp'])
+
+            # Save today to cache
+            with open(today_cache, 'w') as f:
+                json.dump(serialize_prices_for_cache(today_prices), f, indent=2)
+            print(f"Saved {len(today_prices)} today prices to cache")
+
+        # Fetch tomorrow
+        if not tomorrow_prices:
+            day_after = tomorrow + timedelta(days=1)
+            params = {
+                'period_from': f"{tomorrow}T00:00:00Z",
+                'period_to': f"{day_after}T00:00:00Z"
+            }
+            print(f"Fetching tomorrow's prices...")
+            try:
+                response = requests.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+
+                for item in data['results']:
+                    valid_from_utc = datetime.fromisoformat(item['valid_from'].replace('Z', '+00:00'))
+                    valid_from_local = valid_from_utc.astimezone()
+                    if valid_from_local.date() == tomorrow:
+                        tomorrow_prices.append({
+                            'hour': valid_from_local.hour,
+                            'minute': valid_from_local.minute,
+                            'price': item['value_inc_vat'],
+                            'timestamp': valid_from_local,
+                            'date': valid_from_local.date()
+                        })
+
+                tomorrow_prices.sort(key=lambda x: x['timestamp'])
+
+                if tomorrow_prices:
+                    # Save tomorrow to cache
+                    with open(tomorrow_cache, 'w') as f:
+                        json.dump(serialize_prices_for_cache(tomorrow_prices), f, indent=2)
+                    print(f"Saved {len(tomorrow_prices)} tomorrow prices to cache")
+            except requests.RequestException as e:
+                print(f"Tomorrow's prices not available yet: {e}")
+
+        return today_prices, tomorrow_prices
+
+    except Exception as e:
+        print(f"Error fetching Agile prices: {e}")
+        return [], []
+
+
+def fetch_gas_price():
+    """Fetch gas tracker price - returns (today_price, tomorrow_price)"""
+    try:
+        today = datetime.now().date()
+        tomorrow = today + timedelta(days=1)
+
+        url = f"https://api.octopus.energy/v1/products/{GAS_PRODUCT}/gas-tariffs/G-1R-{GAS_PRODUCT}-{REGION}/standard-unit-rates/"
+
+        # Fetch today and tomorrow in one call
+        params = {
+            'period_from': f"{today}T00:00:00Z",
+            'period_to': f"{tomorrow}T23:59:59Z"
+        }
+
+        print(f"Fetching gas prices...")
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        today_price = None
+        tomorrow_price = None
+
+        for item in data['results']:
+            valid_from_utc = datetime.fromisoformat(item['valid_from'].replace('Z', '+00:00'))
+            valid_from_local = valid_from_utc.astimezone()
+
+            if valid_from_local.date() == today:
+                today_price = item['value_inc_vat']
+            elif valid_from_local.date() == tomorrow:
+                tomorrow_price = item['value_inc_vat']
+
+        print(f"Gas - Today: {today_price}p/kWh, Tomorrow: {tomorrow_price}p/kWh")
+        return today_price, tomorrow_price
+
+    except Exception as e:
+        print(f"Error fetching gas price: {e}")
+        return None, None
+
+
+def draw_price_with_small_p(draw, x, y, price, font_main, font_small, color):
+    """Draw price with smaller 'p' suffix aligned to bottom of numerals"""
+    price_str = f"{price:.1f}"
+    draw.text((x, y), price_str, font=font_main, fill=color)
+
+    # Get bounding boxes to align 'p' to bottom
+    main_bbox = draw.textbbox((x, y), price_str, font=font_main)
+    p_bbox = draw.textbbox((0, 0), "p", font=font_small)
+
+    # Position 'p' after the price, aligned to bottom with slight offset up
+    p_x = main_bbox[2] + 1
+    p_y = main_bbox[3] - (p_bbox[3] - p_bbox[1]) - 2  # Align bottom edges, 2px higher
+
+    draw.text((p_x, p_y), "p", font=font_small, fill=color)
+
+
+def draw_header(draw, now):
+    """Draw title and current time"""
+    draw.text((MARGIN, TITLE_Y), "Octopus Energy", font=font_medium, fill=TEXT_COLOR)
+
+    time_str = now.strftime("%H:%M")
+    time_bbox = draw.textbbox((0, 0), time_str, font=font_medium)
+    time_width = time_bbox[2] - time_bbox[0]
+    draw.text((WIDTH - time_width - MARGIN, TITLE_Y), time_str, font=font_medium, fill=TEXT_COLOR)
+
+
+def draw_price_boxes(draw, current_price, min_price, max_price, gas_today, gas_tomorrow, has_tomorrow):
+    """Draw the price information boxes at the top"""
+    box_half_height = BOX_HEIGHT // 2
+
+    # Current price box (left third)
+    current_color = get_price_color(current_price) if current_price else BLUE
+    draw.rectangle([(MARGIN, BOX_Y_OFFSET), (WIDTH//3 - 2, BOX_Y_OFFSET + BOX_HEIGHT)], fill=current_color)
+    draw.text((MARGIN + MARGIN, BOX_Y_OFFSET + BOX_LABEL_Y_OFFSET), "Now", font=font_small, fill=LABEL_BRIGHT_COLOR)
+    if current_price:
+        draw_price_with_small_p(draw, MARGIN + MARGIN, BOX_Y_OFFSET + BOX_PRICE_Y_OFFSET, current_price, font_xlarge, font_medium, TEXT_COLOR)
+
+    # Min price box (middle third, top half)
+    min_color = get_price_color(min_price)
+    draw.rectangle([(WIDTH//3 + 2, BOX_Y_OFFSET), (2*WIDTH//3 - 2, BOX_Y_OFFSET + box_half_height - 1)], fill=min_color)
+    draw.text((WIDTH//3 + BOX_LABEL_PADDING, BOX_Y_OFFSET + BOX_LABEL_Y_OFFSET), "Min", font=font_small, fill=LABEL_BRIGHT_COLOR)
+    draw_price_with_small_p(draw, WIDTH//3 + 35, BOX_Y_OFFSET + BOX_LABEL_Y_OFFSET, min_price, font_large, font_small, TEXT_COLOR)
+
+    # Max price box (middle third, bottom half)
+    max_color = get_price_color(max_price)
+    draw.rectangle([(WIDTH//3 + 2, BOX_Y_OFFSET + box_half_height + 1), (2*WIDTH//3 - 2, BOX_Y_OFFSET + BOX_HEIGHT)], fill=max_color)
+    draw.text((WIDTH//3 + BOX_LABEL_PADDING, BOX_Y_OFFSET + box_half_height + BOX_LABEL_Y_OFFSET), "Max", font=font_small, fill=LABEL_BRIGHT_COLOR)
+    draw_price_with_small_p(draw, WIDTH//3 + 35, BOX_Y_OFFSET + box_half_height + BOX_LABEL_Y_OFFSET, max_price, font_large, font_small, TEXT_COLOR)
+
+    # Gas price box (right third)
+    draw.rectangle([(2*WIDTH//3 + 2, BOX_Y_OFFSET), (WIDTH - MARGIN, BOX_Y_OFFSET + BOX_HEIGHT)], fill=ORANGE)
+    draw.text((2*WIDTH//3 + BOX_LABEL_PADDING, BOX_Y_OFFSET + BOX_LABEL_Y_OFFSET), "Gas", font=font_small, fill=(255, 250, 240))
+    if gas_today:
+        draw_price_with_small_p(draw, 2*WIDTH//3 + BOX_LABEL_PADDING, BOX_Y_OFFSET + BOX_PRICE_Y_OFFSET, gas_today, font_xlarge, font_medium, TEXT_COLOR)
+
+    # Tomorrow gas price in top-right if available
+    if has_tomorrow and gas_tomorrow:
+        gas_box_right = WIDTH - MARGIN
+        price_str = f"{gas_tomorrow:.1f}"
+        price_bbox = draw.textbbox((0, 0), price_str, font=font_medium)
+        price_width = price_bbox[2] - price_bbox[0]
+        p_bbox = draw.textbbox((0, 0), "p", font=font_tiny)
+        p_width = p_bbox[2] - p_bbox[0]
+        total_price_width = price_width + p_width + 1
+
+        # Label above the price - centered with the price
+        tmrw_bbox = draw.textbbox((0, 0), "Tmrw", font=font_tiny)
+        tmrw_width = tmrw_bbox[2] - tmrw_bbox[0]
+        label_x = gas_box_right - total_price_width + ((total_price_width - tmrw_width) // 2)
+        draw.text((label_x, BOX_Y_OFFSET + BOX_LABEL_Y_OFFSET), "Tmrw", font=font_tiny, fill=TOMORROW_LABEL_COLOR)
+
+        # Price below the label - fully right aligned
+        draw_price_with_small_p(draw, gas_box_right - total_price_width, BOX_Y_OFFSET + 14, gas_tomorrow, font_medium, font_tiny, (255, 240, 220))
+
+
+def draw_chart(draw, display_prices, today_prices, tomorrow_prices, current_hour, current_minute, has_tomorrow):
+    """Draw the price chart"""
+    chart_y = BOX_Y_OFFSET + BOX_HEIGHT + BAR_GAP
+    chart_height = HEIGHT - chart_y - CHART_BOTTOM_MARGIN
+    chart_width = WIDTH - 35
+    chart_x = CHART_LABEL_SPACING
+
+    if not display_prices:
+        return
+
+    # Y-axis always includes 0, extends below for negative prices
+    actual_min = min(p['price'] for p in display_prices)
+    chart_min_price = min(0, actual_min)
+    chart_max_price = max(p['price'] for p in display_prices)
+    price_range = chart_max_price - chart_min_price if chart_max_price != chart_min_price else 1
+
+    # Calculate bar width
+    num_bars = len(display_prices)
+    bar_width = chart_width // num_bars
+
+    # Calculate where tomorrow section starts
+    tomorrow_start_idx = len(today_prices)
+    tomorrow_start_x = chart_x + tomorrow_start_idx * bar_width
+
+    # Draw tomorrow background first
+    if has_tomorrow and tomorrow_start_idx < len(display_prices):
+        draw.rectangle([
+            (tomorrow_start_x, chart_y),
+            (chart_x + chart_width, chart_y + chart_height)
+        ], fill=TOMORROW_BG_COLOR)
+
+    # Draw horizontal gridlines
+    for price_level in range(0, int(chart_max_price) + GRIDLINE_INTERVAL, GRIDLINE_INTERVAL):
+        if price_level >= chart_min_price:
+            y_pos = chart_y + chart_height - int((price_level - chart_min_price) / price_range * chart_height)
+            if chart_y <= y_pos <= chart_y + chart_height:
+                draw.line([(chart_x, y_pos), (chart_x + chart_width, y_pos)], fill=GRIDLINE_COLOR, width=1)
+                draw.text((MARGIN, y_pos - 6), str(price_level), font=font_small, fill=Y_AXIS_LABEL_COLOR)
+
+    # Draw bars
+    for i, price_data in enumerate(display_prices):
+        x = chart_x + i * bar_width
+        price = price_data['price']
+        hour = price_data['hour']
+        minute = price_data['minute']
+
+        bar_height = int((price - chart_min_price) / price_range * chart_height)
+        y = chart_y + chart_height - bar_height
+        color = get_price_color(price)
+
+        draw.rectangle([(x, y), (x + bar_width - 2, chart_y + chart_height)], fill=color)
+
+        # Draw current time indicator (only in today section)
+        is_current = hour == current_hour and minute == current_minute // 30 * 30 and i < tomorrow_start_idx
+        if is_current:
+            line_x = x + bar_width // 2
+            for dash_y in range(chart_y, chart_y + chart_height, 6):
+                draw.line([(line_x, dash_y), (line_x, dash_y + 3)], fill=CURRENT_LINE_COLOR, width=1)
+
+        # Draw hour labels (every 4 hours including midnight)
+        if minute == 0 and (hour % 4 == 0 or hour == 0):
+            hour_text = str(hour)
+            text_offset = 3 if hour < 10 else 5
+            text_x = x + (bar_width // 2) - text_offset
+            draw.text((text_x, chart_y + chart_height + 2), hour_text, font=font_small, fill=TEXT_COLOR)
+
+    # Draw tomorrow labels
+    if has_tomorrow and tomorrow_start_idx < len(display_prices):
+        draw.text((tomorrow_start_x + 3, chart_y + MARGIN), "Tmrw", font=font_medium, fill=TOMORROW_LABEL_COLOR)
+
+        # Draw midnight label at start of tomorrow
+        midnight_x = chart_x + tomorrow_start_idx * bar_width + (bar_width // 2) - 3
+        draw.text((midnight_x, chart_y + chart_height + 2), "0", font=font_small, fill=TEXT_COLOR)
+
+        # Tomorrow max electric price
+        tomorrow_max = max(p['price'] for p in tomorrow_prices)
+        tomorrow_max_color = get_price_color(tomorrow_max)
+        chart_right = chart_x + chart_width
+
+        # Draw "Max:" label - right aligned
+        max_label = "Max:"
+        max_label_bbox = draw.textbbox((0, 0), max_label, font=font_small)
+        max_label_width = max_label_bbox[2] - max_label_bbox[0]
+        max_label_x = chart_right - max_label_width - 2
+        draw.text((max_label_x, chart_y + MARGIN), max_label, font=font_small, fill=TOMORROW_LABEL_COLOR)
+
+        # Draw price value - right aligned, color coded, no decimal
+        price_str = f"{int(round(tomorrow_max))}p"
+        price_bbox = draw.textbbox((0, 0), price_str, font=font_large)
+        price_width = price_bbox[2] - price_bbox[0]
+        price_x = chart_right - price_width - 2
+        draw.text((price_x, chart_y + BOX_PRICE_Y_OFFSET), price_str, font=font_large, fill=tomorrow_max_color)
+
+
+def draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow):
+    """Draw the dashboard on the display"""
+    img = Image.new('RGB', (WIDTH, HEIGHT), color=BG_COLOR)
+    draw = ImageDraw.Draw(img)
+    now = datetime.now()
+
+    # Draw header
+    draw_header(draw, now)
+
+    if not today_prices:
+        draw.text((MARGIN * 2, HEIGHT//2), "Loading...", font=font_medium, fill=TEXT_COLOR)
+        disp.display(img)
+        return
+
+    # Keep reference to all of today's prices (before trimming for display)
+    all_today = today_prices.copy()
+
+    # If we have tomorrow's data, show only second half of today (12 hours)
+    has_tomorrow = bool(tomorrow_prices)
+    if has_tomorrow and len(today_prices) >= 24:
+        today_prices = today_prices[24:]  # Show hours 12-23 of today
+
+    # Combine for display
+    display_prices = today_prices + tomorrow_prices
+
+    # Calculate current price, min, and max from complete today data (before trimming)
+    current_hour = now.hour
+    current_minute = now.minute
+    current_price = next((p['price'] for p in all_today if p['hour'] == current_hour and p['minute'] == current_minute // 30 * 30), None)
+    min_price = min(p['price'] for p in all_today)
+    max_price = max(p['price'] for p in all_today)
+
+    # Draw price boxes
+    draw_price_boxes(draw, current_price, min_price, max_price, gas_today, gas_tomorrow, has_tomorrow)
+
+    # Draw chart
+    draw_chart(draw, display_prices, today_prices, tomorrow_prices, current_hour, current_minute, has_tomorrow)
+
+    # Display the image
+    disp.display(img)
+
+
+def main():
+    """Main loop"""
+    print("Starting Octopus Energy Dashboard...")
+    print(f"Display: {WIDTH}x{HEIGHT}, Region: {REGION}")
+
+    disp.begin()
+
+    # Fetch data immediately
+    print("\nFetching initial data...")
+    today_prices, tomorrow_prices = fetch_agile_prices()
+    gas_today, gas_tomorrow = fetch_gas_price()
+
+    # Draw once
+    print("\nDrawing dashboard...")
+    draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow)
+
+    # Run continuously
+    last_update = time.time()
+    update_interval = 300  # 5 minutes
+
+    while True:
+        try:
+            current_time = time.time()
+
+            # Update data every 5 minutes
+            if current_time - last_update > update_interval:
+                print("Fetching new data...")
+                today_prices, tomorrow_prices = fetch_agile_prices()
+                gas_today, gas_tomorrow = fetch_gas_price()
+                last_update = current_time
+
+            # Redraw display
+            draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow)
+
+            time.sleep(30)  # Redraw every 30 seconds for time update
+
+        except KeyboardInterrupt:
+            print("\nShutting down...")
+            break
+        except Exception as e:
+            print(f"Error in main loop: {e}")
+            time.sleep(10)
+
+
+if __name__ == "__main__":
+    main()
