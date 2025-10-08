@@ -59,6 +59,29 @@
         group: "{{ dashboard_user }}"
         mode: '0644'
 
+    - name: Copy Home Assistant integration files (optional)
+      copy:
+        src: "{{ item.src }}"
+        dest: "{{ dashboard_dir }}/{{ item.dest }}"
+        owner: "{{ dashboard_user }}"
+        group: "{{ dashboard_user }}"
+        mode: '0644'
+        force: no  # Don't overwrite if it exists
+      loop:
+        - { src: 'ha_integration.py', dest: 'ha_integration.py' }
+        - { src: 'ha_config.py.example', dest: 'ha_config.py.example' }
+
+    - name: Copy ha_config.py if it exists locally (gitignored, contains credentials)
+      copy:
+        src: ha_config.py
+        dest: "{{ dashboard_dir }}/ha_config.py"
+        owner: "{{ dashboard_user }}"
+        group: "{{ dashboard_user }}"
+        mode: '0600'  # More restrictive permissions for credentials
+        force: yes  # Update if local version changes
+      when: lookup('fileglob', 'ha_config.py') | length > 0
+      ignore_errors: yes  # Don't fail deployment if file doesn't exist
+
     - name: Install Python packages
       pip:
         requirements: "{{ dashboard_dir }}/requirements.txt"

@@ -13,6 +13,9 @@ dashboard-*.png
 !dashboard-example-*.png
 display_output_*.png
 
+# Home Assistant integration (keep credentials private)
+ha_config.py
+
 # Ansible
 *.retry
 .vault_pass

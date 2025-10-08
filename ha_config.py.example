@@ -1,0 +1,45 @@
+"""
+Home Assistant Configuration Template
+Copy this file to ha_config.py and fill in your details.
+ha_config.py is gitignored and will not be committed.
+"""
+
+# Your Home Assistant URL (include http:// or https://)
+HA_URL = "http://homeassistant.local:8123"
+
+# Long-lived access token from Home Assistant
+# Create one at: Profile -> Security -> Long-Lived Access Tokens
+HA_TOKEN = "your_long_lived_access_token_here"
+
+# Alert conditions - LED will flash blue when conditions are met
+# Each condition is a dictionary with:
+#   - entity_id: The Home Assistant entity to check
+#   - condition: "equals", "less_than", "greater_than", "not_equals"
+#   - value: The value to compare against (string or number)
+#
+# If CONDITION_LOGIC is "AND", ALL conditions must be true
+# If CONDITION_LOGIC is "OR", ANY condition being true will trigger
+
+CONDITION_LOGIC = "AND"  # "AND" or "OR"
+
+CONDITIONS = [
+    {
+        "entity_id": "sensor.dehumidifier_pm_power",
+        "condition": "less_than",
+        "value": 100,
+        "description": "Dehumidifier power below 100W"
+    },
+    {
+        "entity_id": "fan.electriq_cd25pro_le_v4",
+        "condition": "equals",
+        "value": "on",
+        "description": "Dehumidifier fan is on"
+    }
+]
+
+# Example: Flash if ANY door is open
+# CONDITION_LOGIC = "OR"
+# CONDITIONS = [
+#     {"entity_id": "binary_sensor.front_door", "condition": "equals", "value": "on"},
+#     {"entity_id": "binary_sensor.back_door", "condition": "equals", "value": "on"},
+# ]

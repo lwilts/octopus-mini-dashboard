@@ -12,13 +12,23 @@ import os
 import json
 import glob
 
-# Try to import real ST7789
+# Optional Home Assistant integration for dehumidifier monitoring
 try:
-    import ST7789
-    print("Running with real ST7789 display")
+    from ha_integration import should_flash_dehumidifier
+    HAS_HA_INTEGRATION = True
+    print("Home Assistant integration loaded")
 except ImportError:
-    print("ERROR: ST7789 library not found!")
-    print("Install with: pip3 install st7789")
+    HAS_HA_INTEGRATION = False
+    print("Home Assistant integration not available (optional)")
+
+# Try to import Display HAT Mini
+try:
+    from displayhatmini import DisplayHATMini
+    print("Running with Display HAT Mini")
+    USE_DISPLAY_HAT = True
+except ImportError:
+    print("ERROR: displayhatmini library not found!")
+    print("Install with: pip3 install git+https://github.com/pimoroni/displayhatmini-python.git#subdirectory=library")
     sys.exit(1)
 
 # Display configuration
@@ -26,22 +36,19 @@ WIDTH = {{ display_width }}
 HEIGHT = {{ display_height }}
 ROTATION = {{ display_rotation }}
 
-# Initialize display
-disp = ST7789.ST7789(
-    height=HEIGHT,
-    width=WIDTH,
-    rotation=ROTATION,
-    port=0,
-    cs=1,
-    dc=9,
-    backlight=13,
-    spi_speed_hz=80 * 1000 * 1000
-)
+# Initialize display with LED support
+disp = DisplayHATMini(buffer=None)
+
+# Override ST7789 rotation (DisplayHATMini hardcodes 180, modify internal variable)
+if ROTATION != 180:
+    disp.st7789._rotation = ROTATION
 
 # Configuration
 REGION = "{{ octopus_region }}"
 AGILE_PRODUCT = "{{ agile_product }}"
 GAS_PRODUCT = "{{ gas_product }}"
+WEATHER_LAT = {{ weather_latitude }}
+WEATHER_LON = {{ weather_longitude }}
 
 # Price thresholds
 THRESHOLD_CHEAP = {{ price_thresholds.cheap }}
@@ -118,6 +125,56 @@ def get_price_color(price):
         return YELLOW
     else:
         return RED
+
+
+def set_led_for_price(price, flash_blue=False):
+    """Set RGB LED color based on current electricity price"""
+    # Use direct PWM control (displayhatmini's set_led has incorrect mapping)
+    # PWM duty cycle: 100=off, 0=full on (common anode)
+    # Pins: led_r_pwm=GPIO17(red), led_g_pwm=GPIO27(green), led_b_pwm=GPIO22(blue)
+
+    # Priority 1: Dehumidifier alert (slow blue flash)
+    if flash_blue:
+        # Slow blue flash
+        brightness = int((time.time() % 4) / 4 * 100)  # 0-100 over 4 seconds
+        disp.led_r_pwm.ChangeDutyCycle(100)
+        disp.led_g_pwm.ChangeDutyCycle(100)
+        disp.led_b_pwm.ChangeDutyCycle(brightness)
+        return
+
+    if price is None:
+        disp.led_r_pwm.ChangeDutyCycle(100)
+        disp.led_g_pwm.ChangeDutyCycle(100)
+        disp.led_b_pwm.ChangeDutyCycle(100)
+        print("LED: Off (no price)")
+        return
+
+    # LED: Only show for cheap (green), expensive (yellow), very expensive (red)
+    # No LED for moderate prices (blue range)
+    if price < THRESHOLD_CHEAP:
+        # Green for cheap (full brightness)
+        disp.led_r_pwm.ChangeDutyCycle(100)
+        disp.led_g_pwm.ChangeDutyCycle(0)
+        disp.led_b_pwm.ChangeDutyCycle(100)
+        print(f"LED: Green (price {price:.2f}p < {THRESHOLD_CHEAP}p)")
+    elif price < THRESHOLD_MODERATE:
+        # No LED for moderate (blue) prices
+        disp.led_r_pwm.ChangeDutyCycle(100)
+        disp.led_g_pwm.ChangeDutyCycle(100)
+        disp.led_b_pwm.ChangeDutyCycle(100)
+        print(f"LED: Off (price {price:.2f}p, {THRESHOLD_CHEAP}p-{THRESHOLD_MODERATE}p)")
+    elif price < THRESHOLD_EXPENSIVE:
+        # Yellow for expensive (more red 30%, less green 60%)
+        disp.led_r_pwm.ChangeDutyCycle(30)
+        disp.led_g_pwm.ChangeDutyCycle(60)
+        disp.led_b_pwm.ChangeDutyCycle(100)
+        print(f"LED: Yellow (price {price:.2f}p, {THRESHOLD_MODERATE}p-{THRESHOLD_EXPENSIVE}p)")
+    else:
+        # Red for very expensive (full brightness)
+        disp.led_r_pwm.ChangeDutyCycle(0)
+        disp.led_g_pwm.ChangeDutyCycle(100)
+        disp.led_b_pwm.ChangeDutyCycle(100)
+        print(f"LED: Red (price {price:.2f}p > {THRESHOLD_EXPENSIVE}p)")
 
 
 def serialize_prices_for_cache(prices):
@@ -255,6 +312,32 @@ def fetch_agile_prices():
         return [], []
 
 
+def fetch_weather():
+    """Fetch today's weather from Open-Meteo API - returns (min_temp, max_temp, weather_code)"""
+    try:
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            'latitude': WEATHER_LAT,
+            'longitude': WEATHER_LON,
+            'daily': 'temperature_2m_min,temperature_2m_max,weather_code',
+            'timezone': 'auto',
+            'forecast_days': 1
+        }
+
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        min_temp = data['daily']['temperature_2m_min'][0]
+        max_temp = data['daily']['temperature_2m_max'][0]
+        weather_code = data['daily']['weather_code'][0]
+
+        return min_temp, max_temp, weather_code
+    except Exception as e:
+        print(f"Error fetching weather: {e}")
+        return None, None, None
+
+
 def fetch_gas_price():
     """Fetch gas tracker price - returns (today_price, tomorrow_price)"""
     try:
@@ -310,14 +393,149 @@ def draw_price_with_small_p(draw, x, y, price, font_main, font_small, color):
     draw.text((p_x, p_y), "p", font=font_small, fill=color)
 
 
-def draw_header(draw, now):
-    """Draw title and current time"""
-    draw.text((MARGIN, TITLE_Y), "Octopus Energy", font=font_medium, fill=TEXT_COLOR)
+def get_weather_icon(weather_code):
+    """Map WMO weather code to simple icon name"""
+    if weather_code is None:
+        return 'unknown'
+    elif weather_code == 0:
+        return 'sunny'
+    elif weather_code in [1, 2]:
+        return 'partly_cloudy'
+    elif weather_code == 3:
+        return 'cloudy'
+    elif weather_code in [45, 48]:
+        return 'foggy'
+    elif weather_code in [51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82]:
+        return 'rainy'
+    elif weather_code in [71, 73, 75, 77, 85, 86]:
+        return 'snowy'
+    elif weather_code in [95, 96, 99]:
+        return 'stormy'
+    else:
+        return 'cloudy'
 
+
+def draw_weather_icon(draw, x, y, icon_type, size=16):
+    """Draw weather icon with better graphics"""
+    import math
+    half = size // 2
+    quarter = size // 4
+
+    if icon_type == 'sunny':
+        # Central sun
+        center_size = int(size * 0.5)
+        offset = (size - center_size) // 2
+        draw.ellipse([(x + offset, y + offset), (x + offset + center_size, y + offset + center_size)], fill=(255, 200, 0), outline=(255, 180, 0))
+        # Sun rays
+        ray_length = size * 0.35
+        for angle in range(0, 360, 45):
+            rad = math.radians(angle)
+            x1 = x + half + int((half + 1) * math.cos(rad))
+            y1 = y + half + int((half + 1) * math.sin(rad))
+            x2 = x + half + int((half + ray_length) * math.cos(rad))
+            y2 = y + half + int((half + ray_length) * math.sin(rad))
+            draw.line([(x1, y1), (x2, y2)], fill=(255, 200, 0), width=2)
+
+    elif icon_type == 'partly_cloudy':
+        # Sun in upper left
+        sun_x, sun_y = x + quarter, y + quarter - 1
+        draw.ellipse([(sun_x, sun_y), (sun_x + half - 2, sun_y + half - 2)], fill=(255, 200, 0))
+        # Small rays
+        for angle in [315, 0, 45]:
+            rad = math.radians(angle)
+            sx = sun_x + quarter
+            sy = sun_y + quarter
+            x1 = sx + int(quarter * 0.7 * math.cos(rad))
+            y1 = sy + int(quarter * 0.7 * math.sin(rad))
+            x2 = sx + int(quarter * 1.4 * math.cos(rad))
+            y2 = sy + int(quarter * 1.4 * math.sin(rad))
+            draw.line([(x1, y1), (x2, y2)], fill=(255, 200, 0), width=1)
+        # Cloud
+        cloud_y = y + half
+        draw.ellipse([(x + 1, cloud_y), (x + half, cloud_y + half - 1)], fill=(220, 220, 220), outline=(200, 200, 200))
+        draw.ellipse([(x + quarter, cloud_y - 2), (x + half + quarter, cloud_y + half - 3)], fill=(240, 240, 240), outline=(210, 210, 210))
+        draw.ellipse([(x + half - 2, cloud_y), (x + size - 1, cloud_y + half - 1)], fill=(220, 220, 220), outline=(200, 200, 200))
+
+    elif icon_type == 'cloudy':
+        # Multi-layer cloud
+        cloud_y = y + quarter
+        draw.ellipse([(x, cloud_y + 2), (x + half - 2, cloud_y + half + 2)], fill=(190, 190, 190), outline=(170, 170, 170))
+        draw.ellipse([(x + quarter - 1, cloud_y), (x + half + quarter + 1, cloud_y + half)], fill=(210, 210, 210), outline=(190, 190, 190))
+        draw.ellipse([(x + half - 3, cloud_y + 3), (x + size - 1, cloud_y + half + 3)], fill=(200, 200, 200), outline=(180, 180, 180))
+        draw.ellipse([(x + half - 1, cloud_y + 1), (x + size, cloud_y + half + 1)], fill=(220, 220, 220), outline=(200, 200, 200))
+
+    elif icon_type == 'rainy':
+        # Dark cloud
+        cloud_y = y + 1
+        draw.ellipse([(x + 1, cloud_y + 2), (x + half, cloud_y + half - 1)], fill=(140, 140, 140), outline=(120, 120, 120))
+        draw.ellipse([(x + quarter, cloud_y), (x + half + quarter, cloud_y + half - 2)], fill=(160, 160, 160), outline=(140, 140, 140))
+        draw.ellipse([(x + half - 2, cloud_y + 2), (x + size, cloud_y + half - 1)], fill=(150, 150, 150), outline=(130, 130, 130))
+        # Rain drops
+        rain_start = y + half + 1
+        for i in range(4):
+            rx = x + 2 + i * 3
+            draw.line([(rx, rain_start), (rx + 1, rain_start + 3)], fill=(80, 140, 255), width=1)
+            draw.line([(rx + 1, rain_start + 3), (rx, rain_start + 6)], fill=(80, 140, 255), width=1)
+
+    elif icon_type == 'snowy':
+        # Light cloud
+        cloud_y = y + 1
+        draw.ellipse([(x + 1, cloud_y + 2), (x + half, cloud_y + half - 1)], fill=(230, 230, 240), outline=(210, 210, 220))
+        draw.ellipse([(x + quarter, cloud_y), (x + half + quarter, cloud_y + half - 2)], fill=(240, 240, 250), outline=(220, 220, 230))
+        draw.ellipse([(x + half - 2, cloud_y + 2), (x + size, cloud_y + half - 1)], fill=(235, 235, 245), outline=(215, 215, 225))
+        # Snowflakes
+        snow_start = y + half + 2
+        for i in range(3):
+            sx = x + 3 + i * 4
+            sy = snow_start + (i % 2) * 2
+            # Asterisk snowflake
+            draw.point((sx, sy), fill=TEXT_COLOR)
+            draw.point((sx - 1, sy), fill=TEXT_COLOR)
+            draw.point((sx + 1, sy), fill=TEXT_COLOR)
+            draw.point((sx, sy - 1), fill=TEXT_COLOR)
+            draw.point((sx, sy + 1), fill=TEXT_COLOR)
+
+    elif icon_type == 'stormy':
+        # Very dark cloud
+        cloud_y = y + 1
+        draw.ellipse([(x + 1, cloud_y + 2), (x + half, cloud_y + half - 1)], fill=(80, 80, 80), outline=(60, 60, 60))
+        draw.ellipse([(x + quarter, cloud_y), (x + half + quarter, cloud_y + half - 2)], fill=(100, 100, 100), outline=(80, 80, 80))
+        draw.ellipse([(x + half - 2, cloud_y + 2), (x + size, cloud_y + half - 1)], fill=(90, 90, 90), outline=(70, 70, 70))
+        # Lightning bolt - zigzag
+        bolt_x = x + half
+        bolt_y = y + half
+        draw.line([(bolt_x, bolt_y), (bolt_x - 2, bolt_y + 3)], fill=(255, 255, 100), width=2)
+        draw.line([(bolt_x - 2, bolt_y + 3), (bolt_x, bolt_y + 5)], fill=(255, 255, 100), width=2)
+        draw.line([(bolt_x, bolt_y + 5), (bolt_x - 3, bolt_y + 8)], fill=(255, 255, 100), width=2)
+
+    else:  # foggy or unknown
+        # Foggy layers
+        for i in range(5):
+            y_pos = y + 2 + i * 3
+            line_width = size - (i % 2) * 3
+            draw.line([(x + 1, y_pos), (x + line_width, y_pos)], fill=(180, 180, 190), width=1)
+
+
+def draw_header(draw, now, min_temp, max_temp, weather_code):
+    """Draw weather info and current time"""
+    # Weather info on left: icon first, then max/min temps
+    if min_temp is not None and max_temp is not None:
+        # Draw weather icon first (bigger to fill header space)
+        icon_type = get_weather_icon(weather_code)
+        icon_x = MARGIN
+        icon_y = TITLE_Y
+        draw_weather_icon(draw, icon_x, icon_y, icon_type, size=22)
+
+        # Temperature text after icon
+        temp_text = f"{int(round(max_temp))}°/{int(round(min_temp))}°"
+        temp_x = icon_x + 26
+        draw.text((temp_x, TITLE_Y), temp_text, font=font_large, fill=TEXT_COLOR)
+
+    # Current time on right
     time_str = now.strftime("%H:%M")
-    time_bbox = draw.textbbox((0, 0), time_str, font=font_medium)
+    time_bbox = draw.textbbox((0, 0), time_str, font=font_large)
     time_width = time_bbox[2] - time_bbox[0]
-    draw.text((WIDTH - time_width - MARGIN, TITLE_Y), time_str, font=font_medium, fill=TEXT_COLOR)
+    draw.text((WIDTH - time_width - MARGIN, TITLE_Y), time_str, font=font_large, fill=TEXT_COLOR)
 
 
 def draw_price_boxes(draw, current_price, min_price, max_price, gas_today, gas_tomorrow, has_tomorrow):
@@ -463,18 +681,18 @@ def draw_chart(draw, display_prices, today_prices, tomorrow_prices, current_hour
         draw.text((price_x, chart_y + BOX_PRICE_Y_OFFSET), price_str, font=font_large, fill=tomorrow_max_color)
 
 
-def draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow):
+def draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow, min_temp, max_temp, weather_code):
     """Draw the dashboard on the display"""
     img = Image.new('RGB', (WIDTH, HEIGHT), color=BG_COLOR)
     draw = ImageDraw.Draw(img)
     now = datetime.now()
 
     # Draw header
-    draw_header(draw, now)
+    draw_header(draw, now, min_temp, max_temp, weather_code)
 
     if not today_prices:
         draw.text((MARGIN * 2, HEIGHT//2), "Loading...", font=font_medium, fill=TEXT_COLOR)
-        disp.display(img)
+        disp.st7789.display(img)
         return
 
     # Keep reference to all of today's prices (before trimming for display)
@@ -501,8 +719,16 @@ def draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow):
     # Draw chart
     draw_chart(draw, display_prices, today_prices, tomorrow_prices, current_hour, current_minute, has_tomorrow)
 
+    # Check for dehumidifier alert (optional Home Assistant integration)
+    flash_blue = False
+    if HAS_HA_INTEGRATION:
+        flash_blue = should_flash_dehumidifier()
+
+    # Set LED color based on current price (or flash blue if dehumidifier full)
+    set_led_for_price(current_price, flash_blue=flash_blue)
+
     # Display the image
-    disp.display(img)
+    disp.st7789.display(img)
 
 
 def main():
@@ -510,16 +736,17 @@ def main():
     print("Starting Octopus Energy Dashboard...")
     print(f"Display: {WIDTH}x{HEIGHT}, Region: {REGION}")
 
-    disp.begin()
+    disp.st7789.begin()
 
     # Fetch data immediately
     print("\nFetching initial data...")
     today_prices, tomorrow_prices = fetch_agile_prices()
     gas_today, gas_tomorrow = fetch_gas_price()
+    min_temp, max_temp, weather_code = fetch_weather()
 
     # Draw once
     print("\nDrawing dashboard...")
-    draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow)
+    draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow, min_temp, max_temp, weather_code)
 
     # Run continuously
     last_update = time.time()
@@ -534,10 +761,11 @@ def main():
                 print("Fetching new data...")
                 today_prices, tomorrow_prices = fetch_agile_prices()
                 gas_today, gas_tomorrow = fetch_gas_price()
+                min_temp, max_temp, weather_code = fetch_weather()
                 last_update = current_time
 
             # Redraw display
-            draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow)
+            draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow, min_temp, max_temp, weather_code)
 
             time.sleep(30)  # Redraw every 30 seconds for time update
 
