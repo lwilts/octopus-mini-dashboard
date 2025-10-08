@@ -9,6 +9,7 @@ A compact Raspberry Pi dashboard that displays real-time Octopus Energy Agile el
 - 📊 Real-time Agile electricity pricing with 24-hour chart
 - ⚡ Tomorrow's full 24-hour prices shown when available (usually after 4pm)
 - 💰 Gas tracker pricing included (today + tomorrow when available)
+- 🌤️ Weather display
 - 🎨 Color-coded price indicators (green/blue/yellow/red based on configurable thresholds)
 - 💾 Smart daily price caching with auto-cleanup
 - 🔄 Systemd service with automatic startup and restart
@@ -46,6 +47,10 @@ gas_product: "SILVER-25-09-02"
 
 # Display rotation (0, 90, 180, or 270 degrees)
 display_rotation: 0
+
+# Weather location (get from Google Maps or similar)
+weather_latitude: 51.5074   # Your latitude
+weather_longitude: -0.1278  # Your longitude
 
 # Adjust price color thresholds (pence)
 price_thresholds:
@@ -127,9 +132,9 @@ Generates `dashboard-TIMESTAMP.png` for preview.
 
 ## API Information
 
-Uses public Octopus Energy API endpoints - **no API key required**:
-- Agile electricity rates: Updated every 30 minutes
-- Gas tracker rates: Updated daily
+Uses public API endpoints - **no API key required**:
+- **Octopus Energy API**: Agile electricity and gas tracker rates
+- **Open-Meteo API**: Weather forecasts (free, no registration needed)
 - Data cached locally to minimize API calls
 - Old cache files automatically cleaned up
 
@@ -212,6 +217,8 @@ All settings in `group_vars/all.yml`:
 | `price_thresholds.expensive` | 35 | Yellow threshold (pence/kWh) |
 | `update_interval` | 300 | API fetch interval (seconds) |
 | `redraw_interval` | 30 | Display refresh interval (seconds) |
+| `weather_latitude` | 51.5074 | Location latitude for weather |
+| `weather_longitude` | -0.1278 | Location longitude for weather |
 | `dashboard_dir` | /home/luke/agile-dashboard | Installation directory |
 | `dashboard_user` | luke | User to run service as |
 

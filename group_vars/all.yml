@@ -22,3 +22,7 @@ redraw_interval: 30   # Redraw display every 30 seconds
 # Application Settings
 dashboard_dir: "/home/luke/agile-dashboard"
 dashboard_user: "luke"
+
+# Weather Configuration
+weather_latitude: 51.5074  # London - change to your location
+weather_longitude: -0.1278

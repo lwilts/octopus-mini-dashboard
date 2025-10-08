@@ -6,9 +6,11 @@ After=network.target
 Type=simple
 User={{ dashboard_user }}
 WorkingDirectory={{ dashboard_dir }}
-ExecStart=/usr/bin/python3 {{ dashboard_dir }}/dashboard.py
+ExecStart=/usr/bin/python3 -u {{ dashboard_dir }}/dashboard.py
 Restart=always
 RestartSec=10
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
