@@ -166,7 +166,7 @@ def set_led_for_price(price, flash_blue=False):
     elif price < THRESHOLD_EXPENSIVE:
         # Yellow for expensive (more red 30%, less green 60%)
         disp.led_r_pwm.ChangeDutyCycle(30)
-        disp.led_g_pwm.ChangeDutyCycle(60)
+        disp.led_g_pwm.ChangeDutyCycle(90) # 60
         disp.led_b_pwm.ChangeDutyCycle(100)
         print(f"LED: Yellow (price {price:.2f}p, {THRESHOLD_MODERATE}p-{THRESHOLD_EXPENSIVE}p)")
     else:
