@@ -66,10 +66,10 @@
         owner: "{{ dashboard_user }}"
         group: "{{ dashboard_user }}"
         mode: '0644'
-        force: no  # Don't overwrite if it exists
       loop:
         - { src: 'ha_integration.py', dest: 'ha_integration.py' }
         - { src: 'ha_config.py.example', dest: 'ha_config.py.example' }
+      notify: restart dashboard
 
     - name: Copy ha_config.py if it exists locally (gitignored, contains credentials)
       copy:
@@ -81,6 +81,7 @@
         force: yes  # Update if local version changes
       when: lookup('fileglob', 'ha_config.py') | length > 0
       ignore_errors: yes  # Don't fail deployment if file doesn't exist
+      notify: restart dashboard
 
     - name: Install Python packages
       pip:

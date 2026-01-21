@@ -43,3 +43,8 @@ CONDITIONS = [
 #     {"entity_id": "binary_sensor.front_door", "condition": "equals", "value": "on"},
 #     {"entity_id": "binary_sensor.back_door", "condition": "equals", "value": "on"},
 # ]
+
+# Message of the day - displays in top bar, alternating with weather/time
+# Create a text helper in Home Assistant: Settings -> Devices & Services -> Helpers -> Text
+# Leave empty or set to blank to disable the message display
+MESSAGE_ENTITY_ID = "input_text.message_of_the_day"

@@ -12,14 +12,17 @@ import os
 import json
 import glob
 
-# Optional Home Assistant integration for dehumidifier monitoring
+# Optional Home Assistant integration for dehumidifier monitoring and messages
 try:
-    from ha_integration import should_flash_dehumidifier
+    from ha_integration import should_flash_dehumidifier, get_message_of_the_day
     HAS_HA_INTEGRATION = True
     print("Home Assistant integration loaded")
 except ImportError:
     HAS_HA_INTEGRATION = False
     print("Home Assistant integration not available (optional)")
+
+    def get_message_of_the_day():
+        return None
 
 # Try to import Display HAT Mini
 try:
@@ -175,6 +178,25 @@ def set_led_for_price(price, flash_blue=False):
         disp.led_g_pwm.ChangeDutyCycle(100)
         disp.led_b_pwm.ChangeDutyCycle(100)
         print(f"LED: Red (price {price:.2f}p > {THRESHOLD_EXPENSIVE}p)")
+
+
+def retry_request(url, params=None, max_retries=3, timeout=10):
+    """Make HTTP request with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, params=params, timeout=timeout)
+            response.raise_for_status()
+            return response
+        except requests.RequestException as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                print(f"Request failed (attempt {attempt + 1}/{max_retries}): {e}")
+                print(f"Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                print(f"Request failed after {max_retries} attempts: {e}")
+                raise
+    return None
 
 
 def serialize_prices_for_cache(prices):
@@ -516,9 +538,57 @@ def draw_weather_icon(draw, x, y, icon_type, size=16):
             draw.line([(x + 1, y_pos), (x + line_width, y_pos)], fill=(180, 180, 190), width=1)
 
 
-def draw_header(draw, now, min_temp, max_temp, weather_code):
-    """Draw weather info and current time"""
-    # Weather info on left: icon first, then max/min temps
+def get_message_pages(draw, message, max_width):
+    """
+    Split a message into pages that fit within max_width.
+    Breaks on word boundaries when possible.
+
+    Returns:
+        List of strings, each fitting within max_width
+    """
+    if not message:
+        return []
+
+    pages = []
+    remaining = message
+
+    while remaining:
+        # Try to fit as much as possible
+        test_text = remaining
+        while test_text:
+            bbox = draw.textbbox((0, 0), test_text, font=font_large)
+            text_width = bbox[2] - bbox[0]
+            if text_width <= max_width:
+                pages.append(test_text)
+                remaining = remaining[len(test_text):].lstrip()
+                break
+
+            # Try to break at last space (word boundary)
+            last_space = test_text.rfind(' ')
+            if last_space > 0:
+                # Break at word boundary
+                test_text = test_text[:last_space]
+            else:
+                # No space found, break character by character (single long word)
+                test_text = test_text[:-1]
+
+            # If we can't fit even one character, force break
+            if not test_text:
+                pages.append(remaining[0])
+                remaining = remaining[1:].lstrip()
+                break
+
+    return pages
+
+
+def draw_header(draw, now, min_temp, max_temp, weather_code, message_page=None):
+    """Draw weather info and current time, or a message page"""
+    if message_page is not None:
+        # Display message page - use full width
+        draw.text((MARGIN, TITLE_Y), message_page, font=font_large, fill=TEXT_COLOR)
+        return
+
+    # Normal display: weather info on left, time on right
     if min_temp is not None and max_temp is not None:
         # Draw weather icon first (bigger to fill header space)
         icon_type = get_weather_icon(weather_code)
@@ -681,14 +751,14 @@ def draw_chart(draw, display_prices, today_prices, tomorrow_prices, current_hour
         draw.text((price_x, chart_y + BOX_PRICE_Y_OFFSET), price_str, font=font_large, fill=tomorrow_max_color)
 
 
-def draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow, min_temp, max_temp, weather_code):
+def draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow, min_temp, max_temp, weather_code, message_page=None):
     """Draw the dashboard on the display"""
     img = Image.new('RGB', (WIDTH, HEIGHT), color=BG_COLOR)
     draw = ImageDraw.Draw(img)
     now = datetime.now()
 
-    # Draw header
-    draw_header(draw, now, min_temp, max_temp, weather_code)
+    # Draw header (with optional message page)
+    draw_header(draw, now, min_temp, max_temp, weather_code, message_page=message_page)
 
     if not today_prices:
         draw.text((MARGIN * 2, HEIGHT//2), "Loading...", font=font_medium, fill=TEXT_COLOR)
@@ -738,11 +808,18 @@ def main():
 
     disp.st7789.begin()
 
+    # Create a temporary draw context for measuring text
+    temp_img = Image.new('RGB', (WIDTH, HEIGHT))
+    temp_draw = ImageDraw.Draw(temp_img)
+    max_message_width = WIDTH - (2 * MARGIN)
+
     # Fetch data immediately
     print("\nFetching initial data...")
     today_prices, tomorrow_prices = fetch_agile_prices()
     gas_today, gas_tomorrow = fetch_gas_price()
     min_temp, max_temp, weather_code = fetch_weather()
+    message = get_message_of_the_day()
+    message_pages = get_message_pages(temp_draw, message, max_message_width) if message else []
 
     # Draw once
     print("\nDrawing dashboard...")
@@ -751,6 +828,12 @@ def main():
     # Run continuously
     last_update = time.time()
     update_interval = 300  # 5 minutes
+    display_interval = 5   # 5 seconds per header state
+
+    # Header display state: cycles through message pages (if any), then weather/time
+    # State 0 to N-1 = message pages, state N = weather/time
+    header_state = 0
+    last_header_change = time.time()
 
     while True:
         try:
@@ -762,12 +845,34 @@ def main():
                 today_prices, tomorrow_prices = fetch_agile_prices()
                 gas_today, gas_tomorrow = fetch_gas_price()
                 min_temp, max_temp, weather_code = fetch_weather()
+                message = get_message_of_the_day()
+                message_pages = get_message_pages(temp_draw, message, max_message_width) if message else []
                 last_update = current_time
 
-            # Redraw display
-            draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow, min_temp, max_temp, weather_code)
+                # Reset header state when message changes
+                header_state = 0
+                last_header_change = current_time
 
-            time.sleep(30)  # Redraw every 30 seconds for time update
+            # Update header state every 5 seconds
+            if current_time - last_header_change >= display_interval:
+                last_header_change = current_time
+                if message_pages:
+                    # Cycle: page 0, page 1, ..., page N-1, weather/time, repeat
+                    total_states = len(message_pages) + 1
+                    header_state = (header_state + 1) % total_states
+                else:
+                    header_state = 0  # Always show weather/time when no message
+
+            # Determine what to show in header
+            if message_pages and header_state < len(message_pages):
+                current_message_page = message_pages[header_state]
+            else:
+                current_message_page = None
+
+            # Redraw display
+            draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow, min_temp, max_temp, weather_code, message_page=current_message_page)
+
+            time.sleep(5)  # Redraw every 5 seconds for header alternation
 
         except KeyboardInterrupt:
             print("\nShutting down...")

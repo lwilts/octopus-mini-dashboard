@@ -6,17 +6,25 @@ import requests
 from typing import Optional, Dict, Any
 
 try:
-    from ha_config import (
-        HA_URL,
-        HA_TOKEN,
-        CONDITIONS,
-        CONDITION_LOGIC
-    )
+    from ha_config import HA_URL, HA_TOKEN
     CONFIG_AVAILABLE = True
 except ImportError:
     CONFIG_AVAILABLE = False
     print("ha_config.py not found - Home Assistant integration disabled")
     print("Copy ha_config.py.example to ha_config.py and configure it")
+
+# Optional alert conditions - defaults to empty (no alerts)
+try:
+    from ha_config import CONDITIONS, CONDITION_LOGIC
+except ImportError:
+    CONDITIONS = []
+    CONDITION_LOGIC = "AND"
+
+# Optional message entity - can be configured separately
+try:
+    from ha_config import MESSAGE_ENTITY_ID
+except ImportError:
+    MESSAGE_ENTITY_ID = None
 
 
 def get_entity_state(entity_id: str) -> Optional[dict]:
@@ -90,6 +98,29 @@ def evaluate_condition(condition: Dict[str, Any]) -> bool:
         return str(current_state) != str(expected_value)
 
     return False
+
+
+def get_message_of_the_day() -> Optional[str]:
+    """
+    Get the message of the day from Home Assistant input_text entity.
+
+    Returns:
+        The message string if set and non-empty, None otherwise
+    """
+    if not CONFIG_AVAILABLE or not MESSAGE_ENTITY_ID:
+        return None
+
+    state_data = get_entity_state(MESSAGE_ENTITY_ID)
+    if not state_data:
+        return None
+
+    message = state_data.get("state", "")
+
+    # Return None for empty, unknown, or unavailable states
+    if not message or message.lower() in ("unknown", "unavailable", ""):
+        return None
+
+    return message.strip()
 
 
 def should_flash_dehumidifier() -> bool:
