@@ -254,10 +254,21 @@ def fetch_agile_prices():
             with open(tomorrow_cache, 'r') as f:
                 tomorrow_prices = deserialize_prices_from_cache(json.load(f))
 
-        # If we have both from cache, return them
-        if today_prices and tomorrow_prices:
+        # Validate cache completeness - should have 48 half-hourly entries for a full day
+        today_complete = len(today_prices) >= 48
+        tomorrow_complete = len(tomorrow_prices) >= 48 if tomorrow_prices else True  # Tomorrow is optional
+
+        # If we have both from cache AND today's data is complete, return them
+        if today_prices and tomorrow_prices and today_complete:
             print(f"Loaded {len(today_prices)} today + {len(tomorrow_prices)} tomorrow from cache")
             return today_prices, tomorrow_prices
+        elif today_prices and not tomorrow_prices and today_complete:
+            # Today is complete but no tomorrow data yet (normal in early evening)
+            print(f"Loaded {len(today_prices)} today from cache (no tomorrow data yet)")
+            return today_prices, tomorrow_prices
+        elif not today_complete:
+            print(f"WARNING: Cached today data incomplete ({len(today_prices)}/48), refetching...")
+            today_prices = []  # Clear incomplete cache to trigger refetch
 
         # Otherwise fetch fresh data
         url = f"https://api.octopus.energy/v1/products/{AGILE_PRODUCT}/electricity-tariffs/E-1R-{AGILE_PRODUCT}-{REGION}/standard-unit-rates/"
@@ -269,8 +280,7 @@ def fetch_agile_prices():
                 'period_to': f"{tomorrow}T00:00:00Z"
             }
             print(f"Fetching today's prices...")
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
+            response = retry_request(url, params=params)
             data = response.json()
 
             for item in data['results']:
@@ -287,6 +297,10 @@ def fetch_agile_prices():
 
             today_prices.sort(key=lambda x: x['timestamp'])
 
+            # Validate we got complete data (should be 48 half-hourly slots)
+            if len(today_prices) < 48:
+                print(f"WARNING: Incomplete today data - got {len(today_prices)}/48 entries")
+
             # Save today to cache
             with open(today_cache, 'w') as f:
                 json.dump(serialize_prices_for_cache(today_prices), f, indent=2)
@@ -301,8 +315,7 @@ def fetch_agile_prices():
             }
             print(f"Fetching tomorrow's prices...")
             try:
-                response = requests.get(url, params=params, timeout=10)
-                response.raise_for_status()
+                response = retry_request(url, params=params)
                 data = response.json()
 
                 for item in data['results']:
@@ -320,6 +333,10 @@ def fetch_agile_prices():
                 tomorrow_prices.sort(key=lambda x: x['timestamp'])
 
                 if tomorrow_prices:
+                    # Validate we got complete data
+                    if len(tomorrow_prices) < 48:
+                        print(f"WARNING: Incomplete tomorrow data - got {len(tomorrow_prices)}/48 entries")
+
                     # Save tomorrow to cache
                     with open(tomorrow_cache, 'w') as f:
                         json.dump(serialize_prices_for_cache(tomorrow_prices), f, indent=2)
@@ -346,8 +363,7 @@ def fetch_weather():
             'forecast_days': 1
         }
 
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
+        response = retry_request(url, params=params)
         data = response.json()
 
         min_temp = data['daily']['temperature_2m_min'][0]
@@ -375,8 +391,7 @@ def fetch_gas_price():
         }
 
         print(f"Fetching gas prices...")
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
+        response = retry_request(url, params=params)
         data = response.json()
 
         today_price = None
@@ -780,6 +795,21 @@ def draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow, min_t
     current_hour = now.hour
     current_minute = now.minute
     current_price = next((p['price'] for p in all_today if p['hour'] == current_hour and p['minute'] == current_minute // 30 * 30), None)
+
+    # Fallback: if current price is missing, use the most recent available price
+    if current_price is None and all_today:
+        # Find most recent price before or at current time
+        # Make now timezone-aware for comparison with cached timestamps
+        current_time = datetime.now().astimezone()
+        past_prices = [p for p in all_today if p['timestamp'] <= current_time]
+        if past_prices:
+            current_price = past_prices[-1]['price']
+            print(f"WARNING: Current hour price missing, using most recent: {current_price}p from {past_prices[-1]['hour']}:{past_prices[-1]['minute']:02d}")
+        else:
+            # All prices are in the future, use the first one
+            current_price = all_today[0]['price']
+            print(f"WARNING: All prices are future, using first: {current_price}p")
+
     min_price = min(p['price'] for p in all_today)
     max_price = max(p['price'] for p in all_today)
 
