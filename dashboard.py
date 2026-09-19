@@ -294,10 +294,12 @@ def draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow):
     # Title
     draw.text((5, 5), "Octopus Energy", font=font_medium, fill=TEXT_COLOR)
 
-    # Current time
+    # Current time and date
     now = datetime.now()
-    time_str = now.strftime("%H:%M")
-    draw.text((WIDTH - 60, 5), time_str, font=font_medium, fill=TEXT_COLOR)
+    datetime_str = now.strftime("%-d %b, %H:%M")
+    dt_bbox = draw.textbbox((0, 0), datetime_str, font=font_medium)
+    dt_width = dt_bbox[2] - dt_bbox[0]
+    draw.text((WIDTH - dt_width - 5, 5), datetime_str, font=font_medium, fill=TEXT_COLOR)
 
     if not today_prices:
         draw.text((10, HEIGHT//2), "Loading...", font=font_medium, fill=TEXT_COLOR)
@@ -397,19 +399,26 @@ def draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow):
                 (chart_x + chart_width, chart_y + chart_height)
             ], fill=tomorrow_bg_color)
 
+        # Calculate zero line position
+        zero_y = chart_y + chart_height - int((0 - chart_min_price) / price_range * chart_height)
+
         # Draw horizontal gridlines at 10p intervals - AFTER background, BEFORE bars
         gridline_interval = 10  # pence
         gridline_color = (100, 110, 130)
-        for price_level in range(0, int(chart_max_price) + 10, gridline_interval):
-            if price_level >= chart_min_price:
-                y_pos = chart_y + chart_height - int((price_level - chart_min_price) / price_range * chart_height)
-                # Only draw if within chart bounds
-                if chart_y <= y_pos <= chart_y + chart_height:
-                    draw.line([(chart_x, y_pos), (chart_x + chart_width, y_pos)], fill=gridline_color, width=1)
+        start_level = (int(chart_min_price) // gridline_interval) * gridline_interval
+        for price_level in range(start_level, int(chart_max_price) + 10, gridline_interval):
+            y_pos = chart_y + chart_height - int((price_level - chart_min_price) / price_range * chart_height)
+            # Only draw if within chart bounds
+            if chart_y <= y_pos <= chart_y + chart_height:
+                draw.line([(chart_x, y_pos), (chart_x + chart_width, y_pos)], fill=gridline_color, width=1)
 
-                    # Y-axis labels on the left
-                    label = f"{price_level}"
-                    draw.text((5, y_pos - 6), label, font=font_tiny, fill=(150, 150, 160))
+                # Y-axis labels on the left
+                label = f"{price_level}"
+                draw.text((5, y_pos - 6), label, font=font_tiny, fill=(150, 150, 160))
+
+        # Draw zero line more prominently when negative prices exist
+        if chart_min_price < 0:
+            draw.line([(chart_x, zero_y), (chart_x + chart_width, zero_y)], fill=(180, 180, 200), width=1)
 
         # Draw bars AFTER gridlines
         for i, price_data in enumerate(display_prices):
@@ -418,18 +427,15 @@ def draw_dashboard(today_prices, tomorrow_prices, gas_today, gas_tomorrow):
             hour = price_data['hour']
             minute = price_data['minute']
 
-            # Normalize height
-            bar_height = int((price - chart_min_price) / price_range * chart_height)
-            y = chart_y + chart_height - bar_height
-
             # Color coding
             color = get_price_color(price)
 
             # All bars have same width, with 2px gap
             bar_right = x + bar_width - 2
 
-            # Draw the bar
-            draw.rectangle([(x, y), (bar_right, chart_y + chart_height)], fill=color)
+            # Bar anchors at zero line: positive bars go up, negative bars hang down
+            bar_y = chart_y + chart_height - int((price - chart_min_price) / price_range * chart_height)
+            draw.rectangle([(x, min(bar_y, zero_y)), (bar_right, max(bar_y, zero_y))], fill=color)
 
             # Draw vertical dashed line for current half-hour slot (only in today section)
             is_current = hour == current_hour and minute == current_minute // 30 * 30 and i < tomorrow_start_idx

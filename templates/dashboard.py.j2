@@ -5,7 +5,7 @@ Managed by Ansible - Configuration in group_vars/all.yml
 """
 import time
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime, timezone
 from PIL import Image, ImageDraw, ImageFont
 import sys
 import os
@@ -199,6 +199,50 @@ def retry_request(url, params=None, max_retries=3, timeout=10):
     return None
 
 
+def day_window(day):
+    """Local-midnight-to-midnight window for `day`, as UTC API bounds.
+
+    Returns (period_from, period_to, expected_slots). Using naive datetimes with
+    .astimezone() resolves the UTC offset in effect at that instant, so the window
+    lines up with local midnight even across a DST transition (a day can have 46,
+    48, or 50 half-hourly slots).
+    """
+    start_local = datetime.combine(day, dtime.min).astimezone()
+    end_local = datetime.combine(day + timedelta(days=1), dtime.min).astimezone()
+    expected_slots = int((end_local - start_local).total_seconds() // 1800)
+    fmt = '%Y-%m-%dT%H:%M:%SZ'
+    return (start_local.astimezone(timezone.utc).strftime(fmt),
+            end_local.astimezone(timezone.utc).strftime(fmt),
+            expected_slots)
+
+
+# Octopus sometimes hasn't published a day's last slot or two yet (rather than a
+# real fetch/timezone bug, which tends to drop slots from the start or middle).
+# Tolerate that small a gap and back off retrying it instead of re-hitting the API
+# and re-logging a warning every update_interval for something that won't resolve
+# for a while, if at all.
+MAX_LATE_SLOT_GAP = 2
+LATE_GAP_RETRY_INTERVAL = 3600  # only re-check a late-gap day this often (seconds)
+
+# Last retry attempt per cache file, for the backoff above. Module-level state is
+# fine here - the dashboard runs as a single long-lived process.
+_late_gap_last_attempt = {}
+
+
+def has_only_late_gap(prices, day, expected_slots, max_missing=MAX_LATE_SLOT_GAP):
+    """True if `prices` is missing only up to `max_missing` slots, and they're the
+    last slots of `day` (not yet published) rather than missing from the start or
+    middle (which would indicate a real fetch/timezone bug worth retrying hard)."""
+    missing = expected_slots - len(prices)
+    if not (0 < missing <= max_missing):
+        return False
+    period_from, _, _ = day_window(day)
+    start_utc = datetime.strptime(period_from, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+    have = {p['timestamp'].astimezone(timezone.utc) for p in prices}
+    # Every slot before the tail must be present - only the last `missing` may be absent
+    return all(start_utc + timedelta(minutes=30 * i) in have for i in range(expected_slots - missing))
+
+
 def serialize_prices_for_cache(prices):
     """Convert price list to JSON-serializable format"""
     cache_data = []
@@ -222,6 +266,8 @@ def deserialize_prices_from_cache(cached_data):
 
 def fetch_agile_prices():
     """Fetch Agile electricity prices with caching - returns (today_prices, tomorrow_prices)"""
+    cached_today = []
+    cached_tomorrow = []
     try:
         today = datetime.now().date()
         tomorrow = today + timedelta(days=1)
@@ -254,75 +300,72 @@ def fetch_agile_prices():
             with open(tomorrow_cache, 'r') as f:
                 tomorrow_prices = deserialize_prices_from_cache(json.load(f))
 
-        # Validate cache completeness - should have 48 half-hourly entries for a full day
-        today_complete = len(today_prices) >= 48
-        tomorrow_complete = len(tomorrow_prices) >= 48 if tomorrow_prices else True  # Tomorrow is optional
+        # Keep what we loaded as a fallback - if a refetch below fails, we still
+        # want to show this rather than blank out to "Loading..."
+        cached_today = today_prices
+        cached_tomorrow = tomorrow_prices
 
-        # If we have both from cache AND today's data is complete, return them
-        if today_prices and tomorrow_prices and today_complete:
+        # Validate cache completeness against the actual number of half-hourly
+        # slots for that local day (46/48/50 depending on DST transitions)
+        _, _, today_expected = day_window(today)
+        _, _, tomorrow_expected = day_window(tomorrow)
+        today_complete = len(today_prices) >= today_expected
+        tomorrow_complete = len(tomorrow_prices) >= tomorrow_expected if tomorrow_prices else True  # Tomorrow is optional
+
+        # If we have both from cache AND both are complete, return them
+        if today_prices and tomorrow_prices and today_complete and tomorrow_complete:
             print(f"Loaded {len(today_prices)} today + {len(tomorrow_prices)} tomorrow from cache")
             return today_prices, tomorrow_prices
         elif today_prices and not tomorrow_prices and today_complete:
             # Today is complete but no tomorrow data yet (normal in early evening)
             print(f"Loaded {len(today_prices)} today from cache (no tomorrow data yet)")
             return today_prices, tomorrow_prices
-        elif not today_complete:
-            print(f"WARNING: Cached today data incomplete ({len(today_prices)}/48), refetching...")
-            today_prices = []  # Clear incomplete cache to trigger refetch
+
+        if not today_complete:
+            if has_only_late_gap(today_prices, today, today_expected):
+                last_attempt = _late_gap_last_attempt.get(today_cache, 0)
+                if time.time() - last_attempt >= LATE_GAP_RETRY_INTERVAL:
+                    missing = today_expected - len(today_prices)
+                    print(f"Today's data is missing its last {missing} slot(s) (not yet published) - retrying")
+                    _late_gap_last_attempt[today_cache] = time.time()
+                    today_prices = []  # Allow one refetch attempt
+                # else: keep serving the {len(today_prices)} cached slots quietly,
+                # without refetching, until the backoff interval elapses
+            else:
+                print(f"WARNING: Cached today data incomplete ({len(today_prices)}/{today_expected}), refetching...")
+                today_prices = []  # Clear incomplete cache to trigger refetch
+
+        if tomorrow_prices and not tomorrow_complete:
+            if has_only_late_gap(tomorrow_prices, tomorrow, tomorrow_expected):
+                last_attempt = _late_gap_last_attempt.get(tomorrow_cache, 0)
+                if time.time() - last_attempt >= LATE_GAP_RETRY_INTERVAL:
+                    missing = tomorrow_expected - len(tomorrow_prices)
+                    print(f"Tomorrow's data is missing its last {missing} slot(s) (not yet published) - retrying")
+                    _late_gap_last_attempt[tomorrow_cache] = time.time()
+                    tomorrow_prices = []  # Allow one refetch attempt
+                # else: keep serving the cached slots quietly, same as above
+            else:
+                print(f"WARNING: Cached tomorrow data incomplete ({len(tomorrow_prices)}/{tomorrow_expected}), refetching...")
+                tomorrow_prices = []  # Clear incomplete cache to trigger refetch
 
         # Otherwise fetch fresh data
         url = f"https://api.octopus.energy/v1/products/{AGILE_PRODUCT}/electricity-tariffs/E-1R-{AGILE_PRODUCT}-{REGION}/standard-unit-rates/"
 
         # Fetch today
         if not today_prices:
-            params = {
-                'period_from': f"{today}T00:00:00Z",
-                'period_to': f"{tomorrow}T00:00:00Z"
-            }
+            period_from, period_to, _ = day_window(today)
+            params = {'period_from': period_from, 'period_to': period_to}
             print(f"Fetching today's prices...")
-            response = retry_request(url, params=params)
-            data = response.json()
-
-            for item in data['results']:
-                valid_from_utc = datetime.fromisoformat(item['valid_from'].replace('Z', '+00:00'))
-                valid_from_local = valid_from_utc.astimezone()
-                if valid_from_local.date() == today:
-                    today_prices.append({
-                        'hour': valid_from_local.hour,
-                        'minute': valid_from_local.minute,
-                        'price': item['value_inc_vat'],
-                        'timestamp': valid_from_local,
-                        'date': valid_from_local.date()
-                    })
-
-            today_prices.sort(key=lambda x: x['timestamp'])
-
-            # Validate we got complete data (should be 48 half-hourly slots)
-            if len(today_prices) < 48:
-                print(f"WARNING: Incomplete today data - got {len(today_prices)}/48 entries")
-
-            # Save today to cache
-            with open(today_cache, 'w') as f:
-                json.dump(serialize_prices_for_cache(today_prices), f, indent=2)
-            print(f"Saved {len(today_prices)} today prices to cache")
-
-        # Fetch tomorrow
-        if not tomorrow_prices:
-            day_after = tomorrow + timedelta(days=1)
-            params = {
-                'period_from': f"{tomorrow}T00:00:00Z",
-                'period_to': f"{day_after}T00:00:00Z"
-            }
-            print(f"Fetching tomorrow's prices...")
             try:
                 response = retry_request(url, params=params)
                 data = response.json()
 
+                fetched_today = []
                 for item in data['results']:
                     valid_from_utc = datetime.fromisoformat(item['valid_from'].replace('Z', '+00:00'))
                     valid_from_local = valid_from_utc.astimezone()
-                    if valid_from_local.date() == tomorrow:
-                        tomorrow_prices.append({
+                    if valid_from_local.date() == today:
+                        fetched_today.append({
                             'hour': valid_from_local.hour,
                             'minute': valid_from_local.minute,
                             'price': item['value_inc_vat'],
@@ -330,25 +373,78 @@ def fetch_agile_prices():
                             'date': valid_from_local.date()
                         })
 
-                tomorrow_prices.sort(key=lambda x: x['timestamp'])
+                fetched_today.sort(key=lambda x: x['timestamp'])
+                today_prices = fetched_today
+
+                if len(today_prices) < today_expected:
+                    print(f"WARNING: Incomplete today data - got {len(today_prices)}/{today_expected} entries")
+
+                # Persist a complete day, or one only missing a trailing slot or two
+                # (so the backoff above has something to serve from cache next
+                # cycle) - a more broadly partial response isn't worth caching, it
+                # would just get re-flagged as incomplete and refetched in full
+                if len(today_prices) >= today_expected or has_only_late_gap(today_prices, today, today_expected):
+                    with open(today_cache, 'w') as f:
+                        json.dump(serialize_prices_for_cache(today_prices), f, indent=2)
+                    print(f"Saved {len(today_prices)} today prices to cache")
+                    if len(today_prices) < today_expected:
+                        # Start the backoff clock now - otherwise the next cycle
+                        # sees this same late-gap count for the first time and
+                        # retries again immediately before settling into the hourly cadence
+                        _late_gap_last_attempt[today_cache] = time.time()
+            except requests.RequestException as e:
+                print(f"Error fetching today's prices: {e}")
+                if cached_today:
+                    print(f"Falling back to {len(cached_today)} cached today prices")
+                today_prices = cached_today
+
+        # Fetch tomorrow
+        if not tomorrow_prices:
+            period_from, period_to, _ = day_window(tomorrow)
+            params = {'period_from': period_from, 'period_to': period_to}
+            print(f"Fetching tomorrow's prices...")
+            try:
+                response = retry_request(url, params=params)
+                data = response.json()
+
+                fetched_tomorrow = []
+                for item in data['results']:
+                    valid_from_utc = datetime.fromisoformat(item['valid_from'].replace('Z', '+00:00'))
+                    valid_from_local = valid_from_utc.astimezone()
+                    if valid_from_local.date() == tomorrow:
+                        fetched_tomorrow.append({
+                            'hour': valid_from_local.hour,
+                            'minute': valid_from_local.minute,
+                            'price': item['value_inc_vat'],
+                            'timestamp': valid_from_local,
+                            'date': valid_from_local.date()
+                        })
+
+                fetched_tomorrow.sort(key=lambda x: x['timestamp'])
+                tomorrow_prices = fetched_tomorrow
 
                 if tomorrow_prices:
-                    # Validate we got complete data
-                    if len(tomorrow_prices) < 48:
-                        print(f"WARNING: Incomplete tomorrow data - got {len(tomorrow_prices)}/48 entries")
+                    if len(tomorrow_prices) < tomorrow_expected:
+                        print(f"WARNING: Incomplete tomorrow data - got {len(tomorrow_prices)}/{tomorrow_expected} entries")
 
-                    # Save tomorrow to cache
-                    with open(tomorrow_cache, 'w') as f:
-                        json.dump(serialize_prices_for_cache(tomorrow_prices), f, indent=2)
-                    print(f"Saved {len(tomorrow_prices)} tomorrow prices to cache")
+                    # Persist a complete day, or a trailing-slot-only gap (see today, above)
+                    if len(tomorrow_prices) >= tomorrow_expected or has_only_late_gap(tomorrow_prices, tomorrow, tomorrow_expected):
+                        with open(tomorrow_cache, 'w') as f:
+                            json.dump(serialize_prices_for_cache(tomorrow_prices), f, indent=2)
+                        print(f"Saved {len(tomorrow_prices)} tomorrow prices to cache")
+                        if len(tomorrow_prices) < tomorrow_expected:
+                            _late_gap_last_attempt[tomorrow_cache] = time.time()
             except requests.RequestException as e:
                 print(f"Tomorrow's prices not available yet: {e}")
+                tomorrow_prices = cached_tomorrow
 
         return today_prices, tomorrow_prices
 
     except Exception as e:
         print(f"Error fetching Agile prices: {e}")
-        return [], []
+        if cached_today:
+            print(f"Falling back to {len(cached_today)} cached today prices")
+        return cached_today, cached_tomorrow
 
 
 def fetch_weather():
@@ -616,11 +712,11 @@ def draw_header(draw, now, min_temp, max_temp, weather_code, message_page=None):
         temp_x = icon_x + 26
         draw.text((temp_x, TITLE_Y), temp_text, font=font_large, fill=TEXT_COLOR)
 
-    # Current time on right
-    time_str = now.strftime("%H:%M")
-    time_bbox = draw.textbbox((0, 0), time_str, font=font_large)
-    time_width = time_bbox[2] - time_bbox[0]
-    draw.text((WIDTH - time_width - MARGIN, TITLE_Y), time_str, font=font_large, fill=TEXT_COLOR)
+    # Current date and time on right
+    datetime_str = now.strftime("%-d %b, %H:%M")
+    dt_bbox = draw.textbbox((0, 0), datetime_str, font=font_large)
+    dt_width = dt_bbox[2] - dt_bbox[0]
+    draw.text((WIDTH - dt_width - MARGIN, TITLE_Y), datetime_str, font=font_large, fill=TEXT_COLOR)
 
 
 def draw_price_boxes(draw, current_price, min_price, max_price, gas_today, gas_tomorrow, has_tomorrow):
@@ -631,26 +727,30 @@ def draw_price_boxes(draw, current_price, min_price, max_price, gas_today, gas_t
     current_color = get_price_color(current_price) if current_price else BLUE
     draw.rectangle([(MARGIN, BOX_Y_OFFSET), (WIDTH//3 - 2, BOX_Y_OFFSET + BOX_HEIGHT)], fill=current_color)
     draw.text((MARGIN + MARGIN, BOX_Y_OFFSET + BOX_LABEL_Y_OFFSET), "Now", font=font_small, fill=LABEL_BRIGHT_COLOR)
+    # p/kWh unit label in top-right of Now box
+    unit_bbox = draw.textbbox((0, 0), "p/kWh", font=font_small)
+    unit_width = unit_bbox[2] - unit_bbox[0]
+    draw.text((WIDTH//3 - 2 - unit_width - 2, BOX_Y_OFFSET + BOX_LABEL_Y_OFFSET), "p/kWh", font=font_small, fill=LABEL_BRIGHT_COLOR)
     if current_price:
-        draw_price_with_small_p(draw, MARGIN + MARGIN, BOX_Y_OFFSET + BOX_PRICE_Y_OFFSET, current_price, font_xlarge, font_medium, TEXT_COLOR)
+        draw.text((MARGIN + MARGIN, BOX_Y_OFFSET + BOX_PRICE_Y_OFFSET), f"{current_price:.1f}", font=font_xlarge, fill=TEXT_COLOR)
 
     # Min price box (middle third, top half)
     min_color = get_price_color(min_price)
     draw.rectangle([(WIDTH//3 + 2, BOX_Y_OFFSET), (2*WIDTH//3 - 2, BOX_Y_OFFSET + box_half_height - 1)], fill=min_color)
     draw.text((WIDTH//3 + BOX_LABEL_PADDING, BOX_Y_OFFSET + BOX_LABEL_Y_OFFSET), "Min", font=font_small, fill=LABEL_BRIGHT_COLOR)
-    draw_price_with_small_p(draw, WIDTH//3 + 35, BOX_Y_OFFSET + BOX_LABEL_Y_OFFSET, min_price, font_large, font_small, TEXT_COLOR)
+    draw.text((WIDTH//3 + 35, BOX_Y_OFFSET + BOX_LABEL_Y_OFFSET), f"{min_price:.1f}", font=font_large, fill=TEXT_COLOR)
 
     # Max price box (middle third, bottom half)
     max_color = get_price_color(max_price)
     draw.rectangle([(WIDTH//3 + 2, BOX_Y_OFFSET + box_half_height + 1), (2*WIDTH//3 - 2, BOX_Y_OFFSET + BOX_HEIGHT)], fill=max_color)
     draw.text((WIDTH//3 + BOX_LABEL_PADDING, BOX_Y_OFFSET + box_half_height + BOX_LABEL_Y_OFFSET), "Max", font=font_small, fill=LABEL_BRIGHT_COLOR)
-    draw_price_with_small_p(draw, WIDTH//3 + 35, BOX_Y_OFFSET + box_half_height + BOX_LABEL_Y_OFFSET, max_price, font_large, font_small, TEXT_COLOR)
+    draw.text((WIDTH//3 + 35, BOX_Y_OFFSET + box_half_height + BOX_LABEL_Y_OFFSET), f"{max_price:.1f}", font=font_large, fill=TEXT_COLOR)
 
     # Gas price box (right third)
     draw.rectangle([(2*WIDTH//3 + 2, BOX_Y_OFFSET), (WIDTH - MARGIN, BOX_Y_OFFSET + BOX_HEIGHT)], fill=ORANGE)
     draw.text((2*WIDTH//3 + BOX_LABEL_PADDING, BOX_Y_OFFSET + BOX_LABEL_Y_OFFSET), "Gas", font=font_small, fill=(255, 250, 240))
     if gas_today:
-        draw_price_with_small_p(draw, 2*WIDTH//3 + BOX_LABEL_PADDING, BOX_Y_OFFSET + BOX_PRICE_Y_OFFSET, gas_today, font_xlarge, font_medium, TEXT_COLOR)
+        draw.text((2*WIDTH//3 + BOX_LABEL_PADDING, BOX_Y_OFFSET + BOX_PRICE_Y_OFFSET), f"{gas_today:.1f}", font=font_xlarge, fill=TEXT_COLOR)
 
     # Tomorrow gas price in top-right if available
     if has_tomorrow and gas_tomorrow:
@@ -669,7 +769,7 @@ def draw_price_boxes(draw, current_price, min_price, max_price, gas_today, gas_t
         draw.text((label_x, BOX_Y_OFFSET + BOX_LABEL_Y_OFFSET), "Tmrw", font=font_tiny, fill=TOMORROW_LABEL_COLOR)
 
         # Price below the label - fully right aligned
-        draw_price_with_small_p(draw, gas_box_right - total_price_width, BOX_Y_OFFSET + 14, gas_tomorrow, font_medium, font_tiny, (255, 240, 220))
+        draw.text((gas_box_right - total_price_width, BOX_Y_OFFSET + 14), f"{gas_tomorrow:.1f}", font=font_medium, fill=(255, 240, 220))
 
 
 def draw_chart(draw, display_prices, today_prices, tomorrow_prices, current_hour, current_minute, has_tomorrow):
@@ -703,13 +803,20 @@ def draw_chart(draw, display_prices, today_prices, tomorrow_prices, current_hour
             (chart_x + chart_width, chart_y + chart_height)
         ], fill=TOMORROW_BG_COLOR)
 
+    # Calculate zero line position
+    zero_y = chart_y + chart_height - int((0 - chart_min_price) / price_range * chart_height)
+
     # Draw horizontal gridlines
-    for price_level in range(0, int(chart_max_price) + GRIDLINE_INTERVAL, GRIDLINE_INTERVAL):
-        if price_level >= chart_min_price:
-            y_pos = chart_y + chart_height - int((price_level - chart_min_price) / price_range * chart_height)
-            if chart_y <= y_pos <= chart_y + chart_height:
-                draw.line([(chart_x, y_pos), (chart_x + chart_width, y_pos)], fill=GRIDLINE_COLOR, width=1)
-                draw.text((MARGIN, y_pos - 6), str(price_level), font=font_small, fill=Y_AXIS_LABEL_COLOR)
+    start_level = (int(chart_min_price) // GRIDLINE_INTERVAL) * GRIDLINE_INTERVAL
+    for price_level in range(start_level, int(chart_max_price) + GRIDLINE_INTERVAL, GRIDLINE_INTERVAL):
+        y_pos = chart_y + chart_height - int((price_level - chart_min_price) / price_range * chart_height)
+        if chart_y <= y_pos <= chart_y + chart_height:
+            draw.line([(chart_x, y_pos), (chart_x + chart_width, y_pos)], fill=GRIDLINE_COLOR, width=1)
+            draw.text((MARGIN, y_pos - 6), str(price_level), font=font_small, fill=Y_AXIS_LABEL_COLOR)
+
+    # Draw zero line more prominently when negative prices exist
+    if chart_min_price < 0:
+        draw.line([(chart_x, zero_y), (chart_x + chart_width, zero_y)], fill=(180, 180, 200), width=1)
 
     # Draw bars
     for i, price_data in enumerate(display_prices):
@@ -718,11 +825,11 @@ def draw_chart(draw, display_prices, today_prices, tomorrow_prices, current_hour
         hour = price_data['hour']
         minute = price_data['minute']
 
-        bar_height = int((price - chart_min_price) / price_range * chart_height)
-        y = chart_y + chart_height - bar_height
         color = get_price_color(price)
 
-        draw.rectangle([(x, y), (x + bar_width - 2, chart_y + chart_height)], fill=color)
+        # Bar anchors at zero line: positive bars go up, negative bars hang down
+        bar_y = chart_y + chart_height - int((price - chart_min_price) / price_range * chart_height)
+        draw.rectangle([(x, min(bar_y, zero_y)), (x + bar_width - 2, max(bar_y, zero_y))], fill=color)
 
         # Draw current time indicator (only in today section)
         is_current = hour == current_hour and minute == current_minute // 30 * 30 and i < tomorrow_start_idx
@@ -759,7 +866,7 @@ def draw_chart(draw, display_prices, today_prices, tomorrow_prices, current_hour
         draw.text((max_label_x, chart_y + MARGIN), max_label, font=font_small, fill=TOMORROW_LABEL_COLOR)
 
         # Draw price value - right aligned, color coded, no decimal
-        price_str = f"{int(round(tomorrow_max))}p"
+        price_str = f"{int(round(tomorrow_max))}"
         price_bbox = draw.textbbox((0, 0), price_str, font=font_large)
         price_width = price_bbox[2] - price_bbox[0]
         price_x = chart_right - price_width - 2
@@ -858,6 +965,7 @@ def main():
     # Run continuously
     last_update = time.time()
     update_interval = 300  # 5 minutes
+    retry_interval = 60    # retry sooner than a full update_interval after a failed fetch
     display_interval = 5   # 5 seconds per header state
 
     # Header display state: cycles through message pages (if any), then weather/time
@@ -872,12 +980,21 @@ def main():
             # Update data every 5 minutes
             if current_time - last_update > update_interval:
                 print("Fetching new data...")
-                today_prices, tomorrow_prices = fetch_agile_prices()
+                new_today, new_tomorrow = fetch_agile_prices()
                 gas_today, gas_tomorrow = fetch_gas_price()
                 min_temp, max_temp, weather_code = fetch_weather()
                 message = get_message_of_the_day()
                 message_pages = get_message_pages(temp_draw, message, max_message_width) if message else []
-                last_update = current_time
+
+                if new_today:
+                    # Only replace what's on screen once we actually have data -
+                    # a failed fetch (e.g. no network, cold start with no cache)
+                    # must not blank out prices that are already being displayed.
+                    today_prices, tomorrow_prices = new_today, new_tomorrow
+                    last_update = current_time
+                else:
+                    print("Fetch returned no price data - keeping previous prices, retrying sooner")
+                    last_update = current_time - update_interval + retry_interval
 
                 # Reset header state when message changes
                 header_state = 0

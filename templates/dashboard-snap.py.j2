@@ -5,7 +5,7 @@ Works on any system without Raspberry Pi hardware
 """
 import time
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime, timezone
 from PIL import Image, ImageDraw, ImageFont
 import sys
 import os
@@ -83,6 +83,20 @@ except Exception as e:
     font_tiny = ImageFont.load_default()
 
 
+def day_window(day):
+    """Local-midnight-to-midnight window for `day`, as UTC API bounds.
+
+    Using naive datetimes with .astimezone() resolves the UTC offset in effect at
+    that instant, so the window lines up with local midnight even across a DST
+    transition (unlike a fixed "T00:00:00Z" string, which drifts by an hour).
+    """
+    start_local = datetime.combine(day, dtime.min).astimezone()
+    end_local = datetime.combine(day + timedelta(days=1), dtime.min).astimezone()
+    fmt = '%Y-%m-%dT%H:%M:%SZ'
+    return (start_local.astimezone(timezone.utc).strftime(fmt),
+            end_local.astimezone(timezone.utc).strftime(fmt))
+
+
 def fetch_agile_prices():
     """Fetch Agile electricity prices with caching"""
     try:
@@ -116,11 +130,11 @@ def fetch_agile_prices():
                 return prices
 
         # Fetch fresh data
-        tomorrow = today + timedelta(days=1)
         url = f"https://api.octopus.energy/v1/products/{AGILE_PRODUCT}/electricity-tariffs/E-1R-{AGILE_PRODUCT}-{REGION}/standard-unit-rates/"
+        period_from, period_to = day_window(today)
         params = {
-            'period_from': f"{today}T00:00:00Z",
-            'period_to': f"{tomorrow}T00:00:00Z"
+            'period_from': period_from,
+            'period_to': period_to
         }
 
         print(f"Fetching Agile prices from: {url}")
@@ -168,9 +182,10 @@ def fetch_gas_price():
         today = datetime.now().date()
         
         url = f"https://api.octopus.energy/v1/products/{GAS_PRODUCT}/gas-tariffs/G-1R-{GAS_PRODUCT}-{REGION}/standard-unit-rates/"
+        period_from, period_to = day_window(today)
         params = {
-            'period_from': f"{today}T00:00:00Z",
-            'period_to': f"{today}T23:59:59Z"
+            'period_from': period_from,
+            'period_to': period_to
         }
         
         print(f"Fetching gas prices from: {url}")
